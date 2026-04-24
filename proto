@@ -1,1 +1,15 @@
 
+syntax = "proto3";
+package telemetry;
+option go_package = "./internal/transport;transport";
+
+message TelemetryPacket {
+  string node_id = 1;
+  int64 timestamp = 2;
+  uint64 cpu_now = 3;
+  uint64 ram_rss = 4;
+  int32 active_jobs = 5;
+  double cpu_delta = 6;
+  double ram_delta = 7;
+  int32 net_err_delta = 8;
+}
