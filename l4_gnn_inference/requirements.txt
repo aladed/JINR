@@ -1,0 +1,6 @@
+torch==2.3.1
+torch-geometric==2.5.3
+confluent-kafka==2.4.0
+redis==5.0.7
+pydantic==2.8.2
+pydantic-settings==2.3.4

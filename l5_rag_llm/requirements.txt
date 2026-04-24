@@ -1,0 +1,5 @@
+openai==1.51.2
+pydantic==2.8.2
+pydantic-settings==2.3.4
+confluent-kafka==2.4.0
+redis==5.0.7
