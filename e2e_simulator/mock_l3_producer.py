@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import pickle
+import json
 import time
 
 import torch
@@ -53,6 +53,30 @@ def generate_synthetic_graph() -> HeteroData:
     return data
 
 
+def heterodata_to_payload(data: HeteroData) -> dict[str, dict[str, list[list[float]]]]:
+    """Convert ``HeteroData`` to JSON-safe payload.
+
+    Args:
+        data: Graph snapshot to serialize.
+
+    Returns:
+        dict[str, dict[str, list[list[float]]]]: JSON-ready payload.
+    """
+
+    x_dict_payload = {
+        node_type: node_store.x.detach().cpu().tolist()
+        for node_type, node_store in data.node_items()
+    }
+    edge_index_payload = {
+        "__".join(edge_type): edge_store.edge_index.detach().cpu().tolist()
+        for edge_type, edge_store in data.edge_items()
+    }
+    return {
+        "x_dict": x_dict_payload,
+        "edge_index_dict": edge_index_payload,
+    }
+
+
 def main() -> None:
     """Run synthetic graph producer loop."""
 
@@ -68,7 +92,7 @@ def main() -> None:
     logger.info("Starting Mock L3 producer. Target topic: %s", topic)
     for _ in range(10):
         graph = generate_synthetic_graph()
-        payload = pickle.dumps(graph)
+        payload = json.dumps(heterodata_to_payload(graph), ensure_ascii=True).encode("utf-8")
         producer.produce(topic=topic, value=payload)
         producer.flush()
         logger.info("Synthetic graph snapshot sent to L3_IN")

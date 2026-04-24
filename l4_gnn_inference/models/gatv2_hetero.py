@@ -53,6 +53,10 @@ class HeteroIncidentGATv2(nn.Module):
             ("vm", "allocated_on", "host"),
             ("job", "allocated_on", "vm"),
         ]
+        self.reverse_edge_types: List[EdgeType] = [
+            (dst, f"rev_{rel}", src) for (src, rel, dst) in self.edge_types
+        ]
+        self.all_edge_types: List[EdgeType] = self.edge_types + self.reverse_edge_types
 
         self.conv1 = HeteroConv(
             {
@@ -62,9 +66,18 @@ class HeteroIncidentGATv2(nn.Module):
                     heads=num_heads,
                     add_self_loops=False,
                 )
-                for edge_type in self.edge_types
+                for edge_type in self.all_edge_types
             },
             aggr="sum",
+        )
+        # Preserve each node's own signal, even if no inbound edges exist.
+        self.self_proj = nn.ModuleDict(
+            {
+                "host": nn.LazyLinear(hidden_channels * num_heads),
+                "vm": nn.LazyLinear(hidden_channels * num_heads),
+                "job": nn.LazyLinear(hidden_channels * num_heads),
+                "switch": nn.LazyLinear(hidden_channels * num_heads),
+            }
         )
 
         self.lin_dict = nn.ModuleDict(
@@ -102,8 +115,8 @@ class HeteroIncidentGATv2(nn.Module):
                 continue
 
             src_type, _, dst_type = edge_type
-            conv_layer = self.conv1.convs[edge_type]
-            conv_out = conv_layer(
+            forward_layer = self.conv1.convs[edge_type]
+            conv_out = forward_layer(
                 (x_dict[src_type], x_dict[dst_type]),
                 edge_index_dict[edge_type],
                 return_attention_weights=True,
@@ -113,15 +126,27 @@ class HeteroIncidentGATv2(nn.Module):
             out_dict[dst_type].append(dst_embeddings)
             attention_weights_dict[edge_type] = attention_weights
 
+            reverse_edge_type = (dst_type, f"rev_{edge_type[1]}", src_type)
+            reverse_layer = self.conv1.convs[reverse_edge_type]
+            reverse_edge_index = edge_index_dict[edge_type].flip(0)
+            reverse_out = reverse_layer(
+                (x_dict[dst_type], x_dict[src_type]),
+                reverse_edge_index,
+                return_attention_weights=True,
+            )
+            src_embeddings, reverse_attention = reverse_out
+            out_dict[src_type].append(src_embeddings)
+            attention_weights_dict[reverse_edge_type] = reverse_attention
+
         hidden_dict: Dict[str, Tensor] = {}
         for node_type, node_features in x_dict.items():
+            self_signal = self.self_proj[node_type](node_features)
             if node_type in out_dict and out_dict[node_type]:
-                hidden_dict[node_type] = F.leaky_relu(torch.stack(out_dict[node_type], dim=0).sum(dim=0))
-            else:
-                num_nodes = int(node_features.size(0))
-                hidden_dict[node_type] = node_features.new_zeros(
-                    (num_nodes, self.hidden_channels * self.num_heads)
+                hidden_dict[node_type] = F.leaky_relu(
+                    self_signal + torch.stack(out_dict[node_type], dim=0).sum(dim=0)
                 )
+            else:
+                hidden_dict[node_type] = F.leaky_relu(self_signal)
 
         logits_dict: Dict[str, Tensor] = {
             node_type: self.lin_dict[node_type](hidden_dict[node_type])

@@ -59,6 +59,9 @@ class InferenceEngine:
             consumer: Consumer used for manual offset commit.
         """
 
+        model_device = next(self.model.parameters()).device
+        hetero_data = hetero_data.to(model_device)
+
         with torch.no_grad():
             anomaly_scores, attention_weights = self.model(
                 hetero_data.x_dict,
