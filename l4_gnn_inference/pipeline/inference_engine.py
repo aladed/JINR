@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Iterable, Tuple
 
+import redis
 import torch
 from torch import Tensor
 from torch_geometric.data import HeteroData
@@ -93,18 +94,36 @@ class InferenceEngine:
 
         if max_score > threshold:
             redis_key = f"incident:{max_node_type}:{max_node_id}"
-            if self.redis_client.exists(redis_key):
-                self.logger.info("Duplicate incident skipped for key '%s'.", redis_key)
-            else:
-                incident_payload: Dict[str, Any] = {
+            try:
+                if self.redis_client.exists(redis_key):
+                    self.logger.info("Duplicate incident skipped for key '%s'.", redis_key)
+                else:
+                    incident_payload: Dict[str, Any] = {
+                        "root_cause_node_type": max_node_type,
+                        "root_cause_node_id": max_node_id,
+                        "anomaly_score": max_score,
+                        "attention_weights": self._serialize_attention_weights(attention_weights),
+                    }
+                    self.producer.send_incident(self.output_topic, incident_payload)
+                    self.redis_client.setex(redis_key, 300, "1")
+                    self.logger.info("Incident emitted and cached with key '%s'.", redis_key)
+            except redis.RedisError as exc:
+                self.logger.error(
+                    "Redis unavailable, deduplication skipped for key '%s': %s",
+                    redis_key,
+                    exc,
+                )
+                incident_payload = {
                     "root_cause_node_type": max_node_type,
                     "root_cause_node_id": max_node_id,
                     "anomaly_score": max_score,
                     "attention_weights": self._serialize_attention_weights(attention_weights),
                 }
                 self.producer.send_incident(self.output_topic, incident_payload)
-                self.redis_client.setex(redis_key, 300, "1")
-                self.logger.info("Incident emitted and cached with key '%s'.", redis_key)
+                self.logger.info(
+                    "Incident emitted without Redis dedup for key '%s'.",
+                    redis_key,
+                )
 
         consumer.commit(kafka_msg)
 

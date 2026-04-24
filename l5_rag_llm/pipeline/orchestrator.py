@@ -81,7 +81,8 @@ class L5Orchestrator:
             playbook_dsl = self.llm_generator.generate_playbook(alert_data, context)
 
             final_payload: Dict[str, Any] = dict(alert_data)
-            final_payload["playbook"] = playbook_dsl.model_dump()
+            # Use JSON mode to convert Enum values to plain strings.
+            final_payload["playbook"] = playbook_dsl.model_dump(mode="json")
             final_payload["timestamp"] = datetime.now(timezone.utc).isoformat()
             self.logger.debug("Final L5 payload: %s", json.dumps(final_payload, ensure_ascii=True))
 
