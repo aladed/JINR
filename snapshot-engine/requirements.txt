@@ -1,0 +1,4 @@
+polars==0.20.10
+confluent-kafka==2.3.0
+protobuf==4.25.2
+redis==5.0.1
