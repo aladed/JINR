@@ -1,0 +1,71 @@
+============================================================
+Step 9: Dataset diagnostics (sample=150)
+============================================================
+
+[1] CLASS BALANCE
+  Loaded graphs  : 150
+  Healthy        : 109  (72.7%)
+  Faulted        : 41  (27.3%)
+
+  Positive labels per node type:
+    cpu             pos=   0  masked=  198  mask_rate=1.32%
+    gpu             pos=   0  masked=  166  mask_rate=1.11%
+    ram             pos=  11  masked=    0  mask_rate=0.00%
+    hdd             pos=  16  masked=    0  mask_rate=0.00%
+    switch          pos=  14  masked=    0  mask_rate=0.00%
+    job             pos=   0  masked=  991  mask_rate=1.32%
+
+[2] FEATURE DISTRIBUTION ANALYSIS
+  cpu             D= 24  mean=[-0.071,0.061]  std=[0.951,1.054]  collapsed=0  exploding=0
+  gpu             D= 35  mean=[-0.081,0.071]  std=[0.953,1.037]  collapsed=0  exploding=0
+  ram             D= 24  mean=[-0.068,0.081]  std=[0.967,1.045]  collapsed=0  exploding=0
+  hdd             D= 24  mean=[-0.023,0.044]  std=[0.957,1.041]  collapsed=0  exploding=0
+  switch          D= 30  mean=[-0.214,0.307]  std=[0.820,1.215]  collapsed=0  exploding=0
+  job             D= 31  mean=[-0.030,0.024]  std=[0.985,1.023]  collapsed=0  exploding=0
+
+[3] HEALTHY vs FAULTED SEPARABILITY
+  switch          mean_diff=0.0949  effect_size=0.094  OK
+  hdd             mean_diff=0.0162  effect_size=0.016  OK
+  ram             mean_diff=0.0160  effect_size=0.016  OK
+  cpu             mean_diff=0.0122  effect_size=0.012  OK
+  job             mean_diff=0.0127  effect_size=0.013  OK
+
+[4] LABEL LEAKAGE DETECTION
+  ram             max_feature_label_corr=0.0984  OK
+  hdd             max_feature_label_corr=0.1384  OK
+  switch          max_feature_label_corr=0.3943  OK
+
+[5] TEMPORAL CONSISTENCY
+  cpu             delta_short_std=1.0146  delta_long_std=0.9928  OK
+  switch          delta_short_std=1.0084  delta_long_std=1.0240  OK
+  job             delta_short_std=1.0011  delta_long_std=1.0047  OK
+
+[5b] TEMPORAL REALISM CHECK (delta_short RC / healthy)
+  hdd             rc_delta_short=0.7454  healthy_delta_short=0.7963  ratio=0.94  OK
+  switch          rc_delta_short=0.7628  healthy_delta_short=0.8337  ratio=0.91  OK
+  ram             rc_delta_short=0.8736  healthy_delta_short=0.8001  ratio=1.09  OK
+
+[6] FAULT PROPAGATION ANALYSIS
+  Victim count per graph:  min=0  max=124  mean=33.0  std=43.3
+  Graphs with 0 victims: 2
+
+[7] GRAPH STRUCTURE VALIDATION
+  Structure check (10 graphs): OK
+  Node count stability: OK
+
+[8] TRAINABILITY HEURISTICS
+  Class imbalance ratio (healthy/faulted) : 2.66
+  Masking rate job                        : 1.32%
+  Masking rate cpu                        : 1.32%
+  Estimated task difficulty               : MEDIUM
+
+============================================================
+WARNINGS (1):
+  WARNING: 2 faulted graphs have 0 victims
+
+Dataset quality score : 95/100
+Leakage risk          : LOW
+Trainability estimate : MEDIUM
+Recommended next phase: Step 10 -- train.py with GATv2 + masked BCE loss
+
+Step 9 diagnostics PASSED.
