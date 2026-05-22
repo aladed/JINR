@@ -814,10 +814,18 @@ def _resolve_fault_plan(
             ("ram", rc_host, pf_idx,   amp * 0.80,     +1.0, rc_act),
         ]
 
-        # Cross-type: ram leak occasionally shows mild cpu_iowait signature
-        if rng.random() < 0.20:
-            iowait_idx = _feat_idx("cpu", "cpu_iowait_percent")
-            all_anomalies.append(("cpu", rc_host, iowait_idx, amp * 0.12, +1.0, rc_act))
+        # Downstream CPU: memory pressure -> kernel reclaim / swap overhead.
+        # Phase-4 fix: structural corroboration for the RC ram node, matching
+        # hdd_degradation (see artifacts/phase5_ram_diagnostic.md).
+        sys_idx = _feat_idx("cpu", "cpu_system_percent")
+        victim_cpus_rl: List[int] = []
+        if rng.random() < 0.70:
+            victim_cpus_rl.append(rc_host)
+            atten   = float(rng.uniform(0.15, 0.9))
+            noise_v = float(rng.normal(0.0, 0.05))
+            act_cpu = activation_step_for("cpu", rc_host)
+            all_anomalies.append(("cpu", rc_host, sys_idx,
+                                  amp * 0.6 * atten + noise_v, +1.0, act_cpu))
 
         ram_idx     = _feat_idx("job", "job_ram_usage_percent")
         wait_idx    = _feat_idx("job", "job_wait_time_seconds")
@@ -835,7 +843,7 @@ def _resolve_fault_plan(
                     ("job", jid, runtime_idx, v_amp * 0.35, +1.0, act_job),
                 ]
 
-        victim_node_ids = {"job": victim_jobs_rl}
+        victim_node_ids = {"cpu": victim_cpus_rl, "job": victim_jobs_rl}
 
     # --- Labels ---
     y_dict: Dict[str, torch.Tensor] = {}
