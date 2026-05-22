@@ -83,6 +83,9 @@ SEED         = 42
 # Phase-2 recalibration (see artifacts/phase1_summary.md)
 POS_WEIGHT_CAP = 20.0   # F2: raw pos_weight up to 332 saturates logits
 
+# Phase-5 / E1: listwise root-cause objective — L = BCE + LISTWISE_WEIGHT * listwise
+LISTWISE_WEIGHT = 1.0
+
 EDGE_DIM_PHYSICAL = 19
 EDGE_DIM_DUMMY    = 1
 
@@ -332,6 +335,72 @@ def compute_masked_loss(
 
 
 # ---------------------------------------------------------------------------
+# Listwise root-cause loss (Phase 5 / E1)
+# ---------------------------------------------------------------------------
+
+def _listwise_graph_loss(
+    cand_logits: torch.Tensor, cand_labels: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Per-graph listwise loss: -log softmax(cand_logits)[true RC index].
+
+    Returns None for graphs with no candidate nodes or no root cause
+    (healthy graphs) — they contribute nothing to the objective.
+    """
+    if cand_logits.numel() == 0 or int(cand_labels.sum()) == 0:
+        return None
+    rc_idx = int(torch.argmax(cand_labels))
+    logp = torch.log_softmax(cand_logits, dim=0)
+    return -logp[rc_idx]
+
+
+def compute_listwise_loss(
+    logits: Dict[str, torch.Tensor],
+    batch: HeteroData,
+    device: torch.device,
+) -> torch.Tensor:
+    """E1: mean per-graph listwise root-cause loss.
+
+    For each faulted graph, softmax over the concatenated candidate-node
+    logits {hdd,switch,ram} and penalise -log p(true RC). Reuses the BCE
+    head logits — no extra parameters. Healthy and malformed (no-candidate)
+    graphs are skipped; safe against empty softmax and NaN.
+    """
+    n_graphs = int(getattr(batch, "num_graphs", 1))
+    per_logits: List[List[torch.Tensor]] = [[] for _ in range(n_graphs)]
+    per_labels: List[List[torch.Tensor]] = [[] for _ in range(n_graphs)]
+
+    for nt in CANDIDATE_TYPES:
+        if nt not in logits or nt not in batch.node_types:
+            continue
+        node = batch[nt]
+        if not hasattr(node, "y") or node.y is None:
+            continue
+        y = node.y
+        gvec = getattr(node, "batch", None)
+        if gvec is None:
+            gvec = torch.zeros(y.size(0), dtype=torch.long, device=y.device)
+        for g in range(n_graphs):
+            m = (gvec == g)
+            if bool(m.any()):
+                per_logits[g].append(logits[nt][m])
+                per_labels[g].append(y[m])
+
+    losses: List[torch.Tensor] = []
+    for g in range(n_graphs):
+        if not per_logits[g]:
+            continue
+        gl = _listwise_graph_loss(
+            torch.cat(per_logits[g]), torch.cat(per_labels[g])
+        )
+        if gl is not None:
+            losses.append(gl)
+
+    if not losses:
+        return torch.zeros((), device=device, requires_grad=True)
+    return torch.stack(losses).mean()
+
+
+# ---------------------------------------------------------------------------
 # Training / validation steps
 # ---------------------------------------------------------------------------
 
@@ -380,6 +449,8 @@ def train_one_epoch(
     """
     model.train()
     total_loss = 0.0
+    total_bce  = 0.0
+    total_lw   = 0.0
     n_batches  = 0
     grad_norms: Dict[str, List[float]] = {nt: [] for nt in CANDIDATE_TYPES}
 
@@ -389,7 +460,9 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         logits = model(x_dict, ei_dict, ea_dict)
-        loss = compute_masked_loss(logits, batch, pos_weights, device)
+        loss_bce = compute_masked_loss(logits, batch, pos_weights, device)
+        loss_lw  = compute_listwise_loss(logits, batch, device)
+        loss = loss_bce + LISTWISE_WEIGHT * loss_lw
 
         if torch.isnan(loss) or torch.isinf(loss):
             print("  [WARN] NaN/Inf loss detected — skipping batch")
@@ -404,6 +477,8 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item()
+        total_bce  += loss_bce.item()
+        total_lw   += loss_lw.item()
         n_batches  += 1
 
     stats: Dict[str, float] = {}
@@ -412,7 +487,10 @@ def train_one_epoch(
             t = torch.tensor(norms)
             stats[f"{nt}_mean"] = round(float(t.mean()), 5)
             stats[f"{nt}_std"]  = round(float(t.std(unbiased=False)), 5)
-    return total_loss / max(n_batches, 1), stats
+    n = max(n_batches, 1)
+    stats["bce_mean"]      = round(total_bce / n, 5)
+    stats["listwise_mean"] = round(total_lw / n, 5)
+    return total_loss / n, stats
 
 
 def validate(
@@ -603,7 +681,9 @@ def main() -> None:
         history["grad_norms"].append(grad_stats)
 
         print(
-            f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | "
+            f"Epoch {epoch:02d} | loss={train_loss:.4f} "
+            f"(bce={grad_stats.get('bce_mean', 0):.3f} "
+            f"lw={grad_stats.get('listwise_mean', 0):.3f}) | "
             f"val_loss={val_loss:.4f} | AUC={val_auc:.4f} | "
             f"F1@best={val_f1:.4f} | RCA={rca_acc:.4f} | MRR={mrr_val:.4f} | "
             f"{elapsed:.1f}s"
@@ -690,12 +770,14 @@ def main() -> None:
                 loss_config=loss_cfg.get("pos_weight", {}),
                 optimizer_config={"optimizer": "AdamW", "lr": LR, "weight_decay": WEIGHT_DECAY},
                 training_config={
-                    "epochs":      EPOCHS,
-                    "batch_size":  BATCH_SIZE,
-                    "patience":    PATIENCE,
-                    "train_ratio": TRAIN_RATIO,
-                    "seed":        SEED,
-                    "device":      str(device),
+                    "epochs":          EPOCHS,
+                    "batch_size":      BATCH_SIZE,
+                    "patience":        PATIENCE,
+                    "train_ratio":     TRAIN_RATIO,
+                    "seed":            SEED,
+                    "device":          str(device),
+                    "pos_weight_cap":  POS_WEIGHT_CAP,
+                    "listwise_weight": LISTWISE_WEIGHT,
                 },
                 metrics={
                     "best_val_f1":          best_val_f1,
