@@ -23,10 +23,9 @@ from typing import Dict, List
 import torch
 
 from training_pipeline import diagnostics
-from training_pipeline.diagnostics import GraphScores
+from training_pipeline.diagnostics import score_loader, typed_to_flat
 from training_pipeline.train import (
-    DROPOUT, HEADS, HIDDEN_DIM, METADATA_PATH, RCADataset, build_dataloaders,
-    GATv2Hetero,
+    DROPOUT, HEADS, HIDDEN_DIM, METADATA_PATH, build_dataloaders, GATv2Hetero,
 )
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -46,56 +45,6 @@ def load_model(ckpt_path: str, device: torch.device):
     model.load_state_dict(state["model_state_dict"])
     model.eval()
     return model, edge_types, state
-
-
-def score_loader(
-    model, loader, edge_types, device,
-) -> List[Dict[str, GraphScores]]:
-    """Per-graph forward. Returns one {candidate_type: (logits, labels)} per graph.
-
-    Each graph is forwarded individually via batch.to_data_list(), so the
-    result does not depend on the loader's batch size.
-    """
-    model.eval()
-    et_set = set(edge_types)
-    typed: List[Dict[str, GraphScores]] = []
-    with torch.no_grad():
-        for batch in loader:
-            for data in batch.to_data_list():
-                data = data.to(device)
-                x = {nt: data[nt].x.float() for nt in data.node_types}
-                ei = {et: data[et].edge_index
-                      for et in data.edge_types if et in et_set}
-                ea = {et: data[et].edge_attr.float()
-                      for et in data.edge_types if et in et_set}
-                logits = model(x, ei, ea)
-                row: Dict[str, GraphScores] = {}
-                for nt in diagnostics.CANDIDATE_TYPES:
-                    node = data[nt] if nt in data.node_types else None
-                    if nt in logits and node is not None \
-                            and hasattr(node, "y") and node.y is not None:
-                        row[nt] = (
-                            logits[nt].detach().reshape(-1).float().cpu(),
-                            node.y.detach().reshape(-1).long().cpu(),
-                        )
-                typed.append(row)
-    return typed
-
-
-def typed_to_flat(typed: List[Dict[str, GraphScores]]) -> List[GraphScores]:
-    """Concatenate each graph's per-type scores into flat candidate scores."""
-    flat: List[GraphScores] = []
-    for row in typed:
-        ls, ys = [], []
-        for nt in diagnostics.CANDIDATE_TYPES:
-            if nt in row:
-                ls.append(row[nt][0])
-                ys.append(row[nt][1])
-        if ls:
-            flat.append((torch.cat(ls), torch.cat(ys)))
-        else:
-            flat.append((torch.empty(0), torch.empty(0, dtype=torch.long)))
-    return flat
 
 
 def evaluate_checkpoint(checkpoint: str, split: str, output: str) -> Dict:

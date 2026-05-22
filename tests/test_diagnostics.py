@@ -17,7 +17,9 @@ import torch
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from training_pipeline.diagnostics import full_report, rca_metrics  # noqa: E402
+from training_pipeline.diagnostics import (  # noqa: E402
+    full_report, rca_metrics, score_loader, typed_to_flat,
+)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -82,7 +84,7 @@ def test_batch_invariance():
         return
     from torch_geometric.loader import DataLoader
     from training_pipeline.train import RCADataset
-    from evaluate_pipeline import load_model, score_loader, typed_to_flat
+    from evaluate_pipeline import load_model
 
     device = torch.device("cpu")
     model, edge_types, _ = load_model(ckpt, device)

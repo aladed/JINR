@@ -236,6 +236,60 @@ def per_type_report(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Model scoring (per-graph, batch-invariant)
+# ---------------------------------------------------------------------------
+
+def score_loader(model, loader, edge_types, device) -> List[Dict[str, GraphScores]]:
+    """Forward every graph individually and return one
+    {candidate_type: (logits, labels)} dict per graph.
+
+    Each graph is forwarded alone (via batch.to_data_list()), so the result
+    is independent of the loader's batch size — this is the fix for the
+    per-batch RCA bug (finding F1).
+    """
+    model.eval()
+    et_set = set(edge_types)
+    typed: List[Dict[str, GraphScores]] = []
+    with torch.no_grad():
+        for batch in loader:
+            for data in batch.to_data_list():
+                data = data.to(device)
+                x = {nt: data[nt].x.float() for nt in data.node_types}
+                ei = {et: data[et].edge_index
+                      for et in data.edge_types if et in et_set}
+                ea = {et: data[et].edge_attr.float()
+                      for et in data.edge_types if et in et_set}
+                logits = model(x, ei, ea)
+                row: Dict[str, GraphScores] = {}
+                for nt in CANDIDATE_TYPES:
+                    node = data[nt] if nt in data.node_types else None
+                    if nt in logits and node is not None \
+                            and hasattr(node, "y") and node.y is not None:
+                        row[nt] = (
+                            logits[nt].detach().reshape(-1).float().cpu(),
+                            node.y.detach().reshape(-1).long().cpu(),
+                        )
+                typed.append(row)
+    return typed
+
+
+def typed_to_flat(typed: List[Dict[str, GraphScores]]) -> List[GraphScores]:
+    """Concatenate each graph's per-type scores into flat candidate scores."""
+    flat: List[GraphScores] = []
+    for row in typed:
+        ls, ys = [], []
+        for nt in CANDIDATE_TYPES:
+            if nt in row:
+                ls.append(row[nt][0])
+                ys.append(row[nt][1])
+        if ls:
+            flat.append((torch.cat(ls), torch.cat(ys)))
+        else:
+            flat.append((torch.empty(0), torch.empty(0, dtype=torch.long)))
+    return flat
+
+
 def summary_line(report: Dict[str, object]) -> str:
     """One-line human summary of a full_report() result."""
     rca = report["rca"]
