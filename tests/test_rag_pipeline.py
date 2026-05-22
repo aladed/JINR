@@ -9,9 +9,13 @@ import pytest
 from pydantic import ValidationError
 
 from llm.llm_client import LLMClient, generate_rule_based_playbook
+from rag.history_tickets import HistoryTicketsStore
+from rag.qdrant_store import QdrantStore
+from rag.redis_context import RedisContextStore
 from remediation.firewall import validate_playbook
+from remediation.incident_aggregator import IncidentAggregator
 from remediation.models import Action, RemediationPlaybook
-from remediation.pipeline import run_pipeline
+from remediation.pipeline import remediation_report_payload, run_pipeline
 
 MOCK_NETWORK = {
     "graph_id": 171,
@@ -137,3 +141,69 @@ def test_write_remediation_report_tmp(tmp_path: Path):
     assert out_file.exists()
     loaded = json.loads(out_file.read_text(encoding="utf-8"))
     assert loaded["playbook"]["incident_id"] == "graph_171_network_congestion"
+
+
+def test_redis_context_fetch_works_with_fakeredis_when_available():
+    client = None
+    expected_source = "dict_fallback"
+    try:
+        import fakeredis
+
+        client = fakeredis.FakeRedis(decode_responses=True)
+        expected_source = "redis"
+    except Exception:
+        pass
+
+    store = RedisContextStore(client=client)
+    context, source = store.fetch_context(MOCK_NETWORK["rc_node"])
+    assert source == expected_source
+    assert context["hostname"] == "leaf-switch-02.govorun.jinr.ru"
+    assert context["node_type"] == "switch"
+
+
+def test_qdrant_retrieval_returns_top_3_sops():
+    store = QdrantStore(top_k=3)
+    chunks, method = store.retrieve(
+        fault_type="network_congestion",
+        rc_node_type="switch",
+        query="network congestion switch qos top talkers",
+        top_k=3,
+    )
+    assert method in {"qdrant", "bow_fallback"}
+    assert len(chunks) == 3
+    assert any(chunk["fault_type"] == "network_congestion" for chunk in chunks)
+
+
+def test_incident_aggregator_assigns_critical_for_many_victims():
+    incident = IncidentAggregator().aggregate(MOCK_NETWORK)
+    assert incident.severity == "CRITICAL"
+    assert incident.affected_nodes_count == 27
+    assert incident.aggregated_from_alerts >= 89
+
+
+def test_history_tickets_retrieved_for_matching_fault_type():
+    tickets = HistoryTicketsStore().find_similar("hdd_degradation")
+    assert tickets
+    assert all(ticket["fault_type"] == "hdd_degradation" for ticket in tickets)
+    assert tickets[0]["ticket_id"].startswith("INC-")
+
+
+def test_ttr_measured_and_under_5000ms():
+    client = LLMClient(force_rule_based=True)
+    _, metadata = run_pipeline(MOCK_NETWORK, llm_client=client)
+    ttr = metadata["ttr_breakdown"]
+    assert {"gnn_inference_ms", "rag_retrieval_ms", "llm_generation_ms", "validation_ms", "total_ms"} <= set(ttr)
+    assert ttr["total_ms"] < 5000
+
+
+def test_full_pipeline_with_all_components_produces_valid_report():
+    client = LLMClient(force_rule_based=True)
+    playbook, metadata = run_pipeline(MOCK_NETWORK, llm_client=client)
+    report = remediation_report_payload(playbook, metadata)
+    assert report["incident"]["id"] == "INC-2026-graph171"
+    assert report["incident"]["severity"] == "CRITICAL"
+    assert report["context"]["rc_hostname"] == "leaf-switch-02.govorun.jinr.ru"
+    assert report["knowledge"]["sop_chunks_retrieved"] == 3
+    assert report["knowledge"]["similar_incidents"]
+    assert report["actions"]
+    assert report["firewall_status"] == "PASSED"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 ALLOWED_ACTIONS_STR = (
@@ -61,6 +61,9 @@ def build_incident_id(graph_id: int | str, fault_type: str) -> str:
 def build_user_prompt(
     inference: Dict[str, Any],
     sop_contexts: List[str],
+    incident: Optional[Dict[str, Any]] = None,
+    node_context: Optional[Dict[str, Any]] = None,
+    similar_incidents: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build user message payload for LLM."""
     rc_node = inference.get("rc_node", {})
@@ -73,7 +76,10 @@ def build_user_prompt(
         "confidence": inference.get("confidence"),
         "victim_node_count": victim_count,
         "top5_candidates": inference.get("top5_candidates", [])[:5],
+        "aggregated_incident": incident or {},
+        "technical_context": node_context or {},
         "sop_excerpts": sop_contexts,
+        "similar_past_incidents": similar_incidents or [],
     }
     return (
         "Generate a remediation playbook for this incident:\n"
@@ -84,8 +90,20 @@ def build_user_prompt(
 def build_messages(
     inference: Dict[str, Any],
     sop_contexts: List[str],
+    incident: Optional[Dict[str, Any]] = None,
+    node_context: Optional[Dict[str, Any]] = None,
+    similar_incidents: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_prompt(inference, sop_contexts)},
+        {
+            "role": "user",
+            "content": build_user_prompt(
+                inference,
+                sop_contexts,
+                incident=incident,
+                node_context=node_context,
+                similar_incidents=similar_incidents,
+            ),
+        },
     ]
