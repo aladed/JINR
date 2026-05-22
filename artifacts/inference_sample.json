@@ -1,25 +1,44 @@
 {
-  "graph_id": 171,
-  "fault_type": "network_congestion",
+  "graph_id": 0,
+  "fault_type": "hdd_degradation",
   "rc_node": {
-    "type": "switch",
-    "id": "S2",
-    "host_id": 2
+    "type": "hdd",
+    "id": "HDD-61",
+    "host_id": 61
   },
-  "rc_logit": 8.52,
+  "rc_logit": 3.093,
+  "rc_score": 0.956603,
   "rc_rank": 1,
   "top5_candidates": [
-    {"type": "switch", "id": "S2", "score": 0.99},
-    {"type": "switch", "id": "S1", "score": 0.01}
+    {
+      "type": "hdd",
+      "id": "HDD-61",
+      "score": 0.9566
+    },
+    {
+      "type": "hdd",
+      "id": "HDD-95",
+      "score": 0.004
+    },
+    {
+      "type": "switch",
+      "id": "SWITCH-3",
+      "score": 0.0009
+    },
+    {
+      "type": "hdd",
+      "id": "HDD-21",
+      "score": 0.0007
+    },
+    {
+      "type": "hdd",
+      "id": "HDD-51",
+      "score": 0.0005
+    }
   ],
-  "victim_nodes": [
-    {"id": "cn-0"}, {"id": "cn-1"}, {"id": "cn-2"}, {"id": "cn-3"},
-    {"id": "cn-4"}, {"id": "cn-5"}, {"id": "cn-6"}, {"id": "cn-7"},
-    {"id": "cn-8"}, {"id": "cn-9"}, {"id": "cn-10"}, {"id": "cn-11"},
-    {"id": "cn-12"}, {"id": "cn-13"}, {"id": "cn-14"}, {"id": "cn-15"},
-    {"id": "cn-16"}, {"id": "cn-17"}, {"id": "cn-18"}, {"id": "cn-19"},
-    {"id": "cn-20"}, {"id": "cn-21"}, {"id": "cn-22"}, {"id": "cn-23"},
-    {"id": "cn-24"}, {"id": "cn-25"}, {"id": "cn-26"}
-  ],
-  "confidence": 0.9998
+  "victim_nodes": [],
+  "confidence": 0.956603,
+  "gnn_inference_ms": 0,
+  "dataset_version": "v3.0.0",
+  "checkpoint_epoch": 14
 }
