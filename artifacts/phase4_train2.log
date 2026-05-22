@@ -1,0 +1,56 @@
+Device: cuda
+Dataset version : v2.1.0
+Dataset hash    : 75066199be54...
+Experiment ID   : exp_20260522_114014_1381e3a7
+pos_weight capped at 20.0 (raw max was 1665.7)
+Dataset: 1000 graphs  |  node types: ['cpu', 'gpu', 'ram', 'hdd', 'switch', 'job', 'rca_context']
+Edge types: 16
+Train: 700 graphs  |  Val: 150 graphs  |  Test: 150 graphs (held out)
+Model parameters: 311,878
+
+==============================================================================
+Training — early-stop signal: best-threshold F1 on val candidate set
+==============================================================================
+Epoch 01 | loss=4.9282 (bce=0.677 lw=4.251) | val_loss=0.4049 | AUC=0.9290 | F1@best=0.2609 | RCA=0.2692 | MRR=0.4203 | 12.7s
+Epoch 02 | loss=2.7070 (bce=0.257 lw=2.450) | val_loss=0.2218 | AUC=0.9510 | F1@best=0.3467 | RCA=0.4038 | MRR=0.5041 | 6.9s
+Epoch 03 | loss=1.6872 (bce=0.141 lw=1.546) | val_loss=0.1916 | AUC=0.9498 | F1@best=0.4225 | RCA=0.4038 | MRR=0.5092 | 7.0s
+Epoch 04 | loss=1.3264 (bce=0.100 lw=1.226) | val_loss=0.1889 | AUC=0.9490 | F1@best=0.4225 | RCA=0.4423 | MRR=0.5488 | 6.8s
+Epoch 05 | loss=0.9680 (bce=0.080 lw=0.888) | val_loss=0.1975 | AUC=0.9503 | F1@best=0.4286 | RCA=0.4423 | MRR=0.5499 | 7.0s
+Epoch 06 | loss=0.8473 (bce=0.067 lw=0.780) | val_loss=0.2789 | AUC=0.9308 | F1@best=0.4270 | RCA=0.4423 | MRR=0.5376 | 7.1s
+Epoch 07 | loss=0.6476 (bce=0.058 lw=0.590) | val_loss=0.2676 | AUC=0.9262 | F1@best=0.3768 | RCA=0.4038 | MRR=0.5197 | 7.1s
+Epoch 08 | loss=0.5100 (bce=0.040 lw=0.470) | val_loss=0.3021 | AUC=0.9251 | F1@best=0.3871 | RCA=0.4231 | MRR=0.5202 | 7.0s
+Epoch 09 | loss=0.4638 (bce=0.034 lw=0.429) | val_loss=0.3912 | AUC=0.9230 | F1@best=0.4211 | RCA=0.4615 | MRR=0.5418 | 8.7s
+Epoch 10 | loss=0.3423 (bce=0.027 lw=0.315) | val_loss=0.3438 | AUC=0.9317 | F1@best=0.4615 | RCA=0.4423 | MRR=0.5383 | 6.9s
+Epoch 11 | loss=0.2808 (bce=0.025 lw=0.255) | val_loss=0.4256 | AUC=0.9199 | F1@best=0.3797 | RCA=0.4423 | MRR=0.5300 | 7.2s
+Epoch 12 | loss=0.2713 (bce=0.029 lw=0.242) | val_loss=0.4320 | AUC=0.9154 | F1@best=0.3478 | RCA=0.3654 | MRR=0.4853 | 6.7s
+Epoch 13 | loss=0.1076 (bce=0.015 lw=0.093) | val_loss=0.5061 | AUC=0.9115 | F1@best=0.3662 | RCA=0.4423 | MRR=0.5128 | 6.6s
+Epoch 14 | loss=0.1456 (bce=0.015 lw=0.131) | val_loss=0.5169 | AUC=0.9080 | F1@best=0.3529 | RCA=0.4038 | MRR=0.5089 | 6.6s
+Epoch 15 | loss=0.0921 (bce=0.013 lw=0.079) | val_loss=0.5257 | AUC=0.9092 | F1@best=0.3824 | RCA=0.4231 | MRR=0.5098 | 6.6s
+
+Early stopping at epoch 15 (patience=5)
+
+Training history saved -> D:\Vlad\JINR\checkpoints\training_history.json
+Best model: epoch 10  val_f1=0.4615
+Loaded best checkpoint from epoch 10
+
+============================================================
+FINAL EVALUATION  (val split)
+============================================================
+  loss : 0.3438
+  AUC=0.9317  F1@0.5=0.2703  F1@best=0.4615 (t=0.97)  RCA-Top1=0.4423  MRR=0.5383
+  rank histogram : {1: 23, 2: 3, 3: 5, 4: 3, 5: 1, 6: 2, 9: 1, 11: 1, 23: 2, 26: 1, 29: 1, 30: 1, 37: 1, 41: 1, 43: 1, 61: 3, 91: 1, 104: 1}
+  hdd      AUC=0.955  F1@best=0.545  RCA-Top1=0.556
+  switch   AUC=0.938  F1@best=0.621  RCA-Top1=0.778
+  ram      AUC=0.854  F1@best=0.182  RCA-Top1=0.312
+Loaded best checkpoint from epoch 10
+
+============================================================
+FINAL EVALUATION  (test split)
+============================================================
+  loss : 0.2492
+  AUC=0.9240  F1@0.5=0.2443  F1@best=0.4516 (t=0.98)  RCA-Top1=0.4444  MRR=0.5375
+  rank histogram : {1: 16, 2: 2, 3: 4, 5: 1, 6: 1, 7: 2, 12: 1, 16: 1, 18: 1, 25: 1, 27: 2, 52: 1, 69: 1, 87: 1, 189: 1}
+  hdd      AUC=0.903  F1@best=0.444  RCA-Top1=0.500
+  switch   AUC=0.968  F1@best=0.538  RCA-Top1=0.846
+  ram      AUC=0.859  F1@best=0.353  RCA-Top1=0.273
+Experiment logged -> experiments/registry.jsonl  [exp_20260522_114014_1381e3a7]
