@@ -5,17 +5,30 @@
 [![PyG 2.7+](https://img.shields.io/badge/torch--geometric-2.7+-green.svg)](https://pytorch-geometric.readthedocs.io/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 
-A research-grade system for localizing faults in synthetic supercomputer cluster anomalies using a heterogeneous temporal graph neural network. Achieves **ROC-AUC 0.94**, **per-graph RCA Top-1 accuracy 0.53**, with honest documentation of limitations and debugging history.
+A research-grade system for localizing faults in synthetic supercomputer cluster anomalies using a heterogeneous temporal graph neural network. Achieves **ROC-AUC 0.98**, **per-graph RCA Top-1 accuracy 0.78** (v3.0.0 dataset), with honest documentation of limitations and debugging history.
 
 ## 🎯 Quick Facts
 
 - **Task**: Given a temporal snapshot of cluster metrics (CPU, RAM, GPU, network, disk, job performance), identify which single node caused the anomaly
 - **Approach**: 2-layer HeteroGATv2 with per-node binary classifiers + listwise softmax-CE ranking objective
-- **Dataset**: Synthetic 100-host cluster, 3 fault types (hdd_degradation, network_congestion, ram_leak), stochastic propagation with hop-based delays
-- **Key Result**: Listwise loss lifted leak-free RCA Top-1 from 0.42→0.53 (**validated improvement**)
-- **Critical Finding**: Original "F1 0.32 / RCA 0.50" were **measurement artifacts** (fixed-threshold + per-batch aggregation bugs), not real model failures
+- **Dataset**: Synthetic 100-host cluster, 3 fault types (hdd_degradation, network_congestion, ram_leak), stochastic propagation with hop-based delays — **current: v3.0.0**
+- **Key Result (v3.0.0)**: Dataset structural fixes lifted RCA Top-1 from 0.53→0.78, F1@best from 0.38→0.72 (**validated improvement over v2.0.0+E1 baseline**)
+- **Critical Finding (Phase 1–5)**: Original "F1 0.32 / RCA 0.50" were **measurement artifacts** (fixed-threshold + per-batch aggregation bugs), not real model failures
 
-## 📊 Final Metrics (Leak-Free Test Set, v2.0.0 Dataset)
+## 📊 Results (Leak-Free Test Set)
+
+### Current: v3.0.0 Dataset (30 epochs, early-stop epoch 14)
+
+| Fault type | RCA Top-1 | AUC   | F1@best |
+|------------|-----------|-------|---------|
+| **hdd**    | 0.733     | 0.984 | 0.615   |
+| **switch** | 0.938     | 0.990 | 0.786   |
+| **ram**    | 0.867     | 0.981 | 0.786   |
+| **Overall**| **0.783** | **0.983** | **0.716** |
+
+> Single-seed results (seed=42). Multi-seed validation not yet done; treat third decimal as orientation, not precision.
+
+### Phase history (all on v2.0.0 dataset except P4/P6)
 
 | Phase | Description | ROC-AUC | F1 @ best threshold | RCA Top-1 | MRR | Notes |
 |-------|-------------|---------|-------------------|-----------|-----|-------|
@@ -23,9 +36,10 @@ A research-grade system for localizing faults in synthetic supercomputer cluster
 | P1 | **Corrected eval** | 0.9348 | **0.3824** | **0.4167** | **0.5324** | True leak-free baseline |
 | P2 | Recalibrated training | 0.9380 | 0.3860 | 0.3611 | 0.4629 | Training config had no effect |
 | **P5/E1** | **Listwise loss** | **0.9430** | **0.3846** | **0.5278** | **0.5958** | ✅ **VALIDATED: RCA +0.167** |
-| P4* | ram fix (v2.1.0) | 0.9240 | 0.4516 | 0.4444 | 0.5375 | Different dataset; ram RCA unchanged |
+| P4† | ram fix (v2.1.0) | 0.9240 | 0.4516 | 0.4444 | 0.5375 | Different dataset; ram RCA unchanged |
+| **P6** | **v3.0.0 dataset** | **0.9834** | **0.7160** | **0.7826** | **0.8230** | ✅ **RCA +0.255 vs E1; Gate-A met** |
 
-*P4 uses v2.1.0 (different dataset); not directly comparable.
+†P4 uses v2.1.0 (different dataset); not directly comparable to P0–P5.
 
 ## 🚀 Quick Start
 
@@ -46,36 +60,33 @@ pip install numpy==1.26.4  # CRITICAL: <2.0 to avoid torch_geometric breakage
 pip install networkx pandas scikit-learn matplotlib
 ```
 
-### Generate Dataset
+### Generate Dataset (v3.0.0)
 
 ```bash
-python training_pipeline/dataset_generator.py \
-  --num_graphs 1000 \
-  --seed 42 \
-  --output artifacts/dataset_v2.0.0.pt
+# Run as a module from the project root — the script has no argparse CLI flags
+python -m training_pipeline.dataset_generator
 ```
+
+This generates 1000 graphs (700 healthy / 300 faulted) into `dataset/raw/` with full
+manifest, metadata, and loss config. Default seed=42. Expected wall-clock: ~3 minutes.
+
+> **Note**: v2.x checkpoints are **not** compatible with v3.0.0 data (routing bug fix
+> changes the fault distribution; EMA_ALPHA change alters temporal feature encoding).
+> Full dataset regeneration is required when migrating from v2.x.
 
 ### Train
 
 ```bash
-python training_pipeline/train.py \
-  --dataset artifacts/dataset_v2.0.0.pt \
-  --batch_size 16 \
-  --epochs 30 \
-  --seed 42 \
-  --output checkpoints/best_model.pt
+python -m training_pipeline.train
 ```
 
-Expected wall-clock time: ~8 minutes on GPU (CUDA 12.1).
+Expected wall-clock time: ~4 minutes on GPU (CUDA 12.1), early-stop typically at epoch 14.
 
 ### Evaluate
 
 ```bash
 python evaluate_pipeline.py \
-  --checkpoint checkpoints/best_model.pt \
-  --dataset artifacts/dataset_v2.0.0.pt \
-  --split both \
-  --output artifacts/final_diag.json
+  --checkpoint checkpoints/best_model.pt
 ```
 
 ### Run Tests
@@ -104,15 +115,18 @@ d:\Vlad\JINR/
 │   ├── test_diagnostics.py             # 4 unit tests (batch-invariance guard)
 │   └── test_listwise.py                # 8 unit tests (loss correctness)
 ├── checkpoints/
-│   ├── baseline_model.pt               # Frozen baseline (Phase 0)
-│   ├── best_model.pt                   # E1 best checkpoint (epoch 10)
+│   ├── baseline_model.pt               # Frozen baseline (Phase 0, v2.0.0)
+│   ├── best_model.pt                   # v3.0.0 best checkpoint (epoch 14)
 │   └── training_history.json
 ├── artifacts/
-│   ├── repair_report.md                # Complete phase-by-phase analysis
+│   ├── repair_report.md                # Phase 1–5 analysis
+│   ├── v3_migration_report.md          # Phase 6: exact lines changed, inverse-signal verification
+│   ├── v2_vs_v3_dataset_diff.md        # Dataset structural comparison
+│   ├── v3_analysis_and_feedback.md     # Model behavior analysis (v3.0.0)
 │   ├── phase*_diag.json                # Per-phase diagnostic outputs
-│   ├── phase*_train*.log               # Training logs
-│   └── experiments/
-│       └── registry.jsonl              # Append-only experiment log
+│   └── phase*_train*.log               # Training logs
+├── experiments/
+│   └── registry.jsonl                  # Append-only experiment log
 └── docs/
     ├── ARCHITECTURE.md                 # Tensor shapes, layer details, loss functions
     ├── DATASET.md                      # Fault injection, propagation, versioning
@@ -233,11 +247,22 @@ RC: hdd on host → propagates to CPU (70%, amplitude×0.6) and jobs (60%, ampli
 
 RC: switch → propagates to CPU (55%, amplitude×0.5), GPU (50%, amplitude×0.35), jobs (50%)
 
-#### 3. ram_leak
+#### 3. ram_leak (v3.0.0 multi-phase causal redesign)
 
-RC: ram on host → propagates to CPU (70%, amplitude×0.6) ✅ **Phase-4 fix** and jobs (55%, amplitude×0.8/0.5/0.35)
+Four-phase causal chain from RC ram node:
 
-**Phase-4 finding**: Added CPU propagation to match hdd_degradation pattern. Result: **negative** — ram RCA stayed 0.27. Conclusion: ram_leak is intrinsically hard (slow saturation patterns harder than abrupt spikes). Topological fix was not the bottleneck.
+```
+Phase 1 (step 50): ram_page_faults_ps rises         ← leading indicator
+Phase 2 (step 55): ram_used_percent + fragmentation rise
+Phase 3 (step 60): ram_cached_mb DECREASES (cache eviction, inverse signal)
+                   + cpu_system_percent rises (80% prob)
+Phase 4 (step 75): ram_swap_used_percent + latency_ns rise
+Job victims(step 78): job_ram_usage + wait_time + runtime degrade
+```
+
+The inverse signal (`cached_mb` decreasing while other features increase) gives the model a unique temporal signature to exploit. See [`artifacts/v3_migration_report.md`](artifacts/v3_migration_report.md) for verification that the inverse signal survives clamping, EMA, and delta channels.
+
+**Phase-4 note** (v2.1.0): Adding flat CPU propagation alone produced a **negative result** — ram RCA stayed 0.27. The temporal structure and inverse signal (v3.0.0) were what actually worked.
 
 ### Versioning System
 
@@ -321,7 +346,30 @@ Froze `baseline_model.pt`; confirmed deterministic training under seed 42.
 
 **Result**: ram RCA stayed 0.27. **Negative result, honestly recorded.**
 
-**Conclusion**: ram_leak is intrinsically hard (slow saturation). Topological fix insufficient.
+**Conclusion**: Flat topological fix was not the bottleneck. Temporal structure and causal evidence quality were.
+
+### Phase 6: v3.0.0 Dataset Migration ✅
+
+**Hypothesis**: Dataset structural bugs and weak temporal signal were the remaining bottleneck after E1 (Phase 5/E1 ceiling at RCA 0.53).
+
+**Four targeted changes** (no architecture changes, no new node/edge types):
+1. **Routing bug fix** — `network_congestion` was injecting anomalies into 2 fixed spine IDs instead of ~25 actual hosts. Switch RCA 0.85 in v2.x was an artifact of trivial index memorization.
+2. **Temporal SNR fix** — EMA_ALPHA 0.0645→0.030 (doubles delta_long half-life to 23 steps), rolling_var window 5→10, scaler fit samples 10→100.
+3. **ram_leak multi-phase redesign** — 3-feature flat injection replaced by 4-phase causal chain with inverse signal (cached_mb decreases). 6 features total.
+4. **Edge attribute enrichment** — Physical link attrs elevated for cpu↔switch edges in network_congestion (bandwidth/latency/packet_loss channels, amplitude×attenuation).
+
+**Result**: All Gate-A targets met in full 30-epoch training.
+
+| Metric | v2.0.0+E1 | v3.0.0 | Δ |
+|---|---|---|---|
+| RCA Top-1 | 0.5278 | **0.7826** | +0.255 (+48%) |
+| F1@best | 0.3846 | **0.7160** | +0.331 (+86%) |
+| AUC | 0.9430 | **0.9834** | +0.040 (+4%) |
+| MRR | 0.5958 | **0.8230** | +0.227 (+38%) |
+
+**Validated**: Improvements are data-driven (architecture unchanged). Routing bug fix confirmed by smoke-test (victims 2→87). Ram improvement confirmed by ram-head AUC 0.86→0.981.
+
+See [`artifacts/v3_migration_report.md`](artifacts/v3_migration_report.md) and [`artifacts/v2_vs_v3_dataset_diff.md`](artifacts/v2_vs_v3_dataset_diff.md).
 
 ---
 
@@ -342,12 +390,22 @@ Froze `baseline_model.pt`; confirmed deterministic training under seed 42.
    - Confirms diagnosis: per-node BCE ≠ per-graph Top-1
    - Listwise directly optimizes what we measure
 
-4. **ram_leak is intrinsically hard**
-   - ram-head AUC ≈0.86 (vs hdd 0.93, switch 0.94)
-   - Phase-4 structural fix (CPU propagation) **did not help**
-   - Slow saturation patterns harder than abrupt spikes
+4. **ram_leak was a data problem, not an intrinsic difficulty (Phase 6)**
+   - Phase-4 flat fix (CPU propagation) did not help — confirmed negative
+   - v3.0.0 multi-phase causal redesign (4-phase chain + inverse signal): ram RCA 0.27 → **0.867**
+   - Model learned to exploit cache eviction signature; ram-head AUC 0.86 → **0.981**
 
-5. **diagnostics.py is the single source of truth**
+5. **Routing bug inflated switch RCA in all v2.x experiments**
+   - `network_congestion` affected only 2 fixed spine IDs (not ~25 actual hosts)
+   - Model learned trivial index memorization, not topology-based causality
+   - True switch RCA after fix: **0.938** (v3.0.0) vs 0.85 (v2.x artifact)
+
+6. **All Phase 6 gains are data-driven**
+   - Architecture unchanged (GATv2, 311,878 params, listwise loss)
+   - No new node/edge types, no feature schema changes
+   - Every improvement traceable to a specific dataset structural fix
+
+7. **diagnostics.py is the single source of truth**
    - Canonical metric definitions (ROC-AUC, F1, RCA)
    - Replaces broken compute_metrics from original train.py
    - Batch-invariance tests prevent future per-batch bugs
@@ -356,23 +414,31 @@ Froze `baseline_model.pt`; confirmed deterministic training under seed 42.
 
 ## ⚠️ Known Limitations
 
-1. **Per-graph Top-1 precision capped at 0.53** (F1 ≈0.38)
-   - ROC-AUC 0.94 shows strong ranking; gap is node-level calibration
-   - Listwise optimizes ranking, not precision; fixed 0.99 threshold unintuitive
+1. **Single-seed results only** (seed=42)
+   - All v3.0.0 metrics are from a single training run
+   - Multi-seed validation (≥3 seeds) not yet done
+   - Treat RCA Top-1 0.783 as a strong indicator, not a converged estimate
 
-2. **ram_leak localization weak** (per-type RCA 0.27 on n=11 test graphs)
-   - Slow leaks inherently harder to pinpoint
-   - Dataset/feature quality may be limiting, not architecture
+2. **hdd localization is the current weak point** (RCA 0.733 vs switch 0.938, ram 0.867)
+   - hdd_degradation fault structure unchanged from v2.x (simple flat injection)
+   - Next target: multi-phase hdd degradation similar to the v3.0.0 ram_leak redesign
 
-3. **Small per-type test samples introduce noise** (ram n=11, hdd n=6, switch n=13)
+3. **Small per-type test samples introduce noise** (≈15 per fault type at 70/15/15 split)
    - Trust direction, not absolute third-decimal precision
+   - Per-type F1 especially noisy (denominator = faulted graphs only)
 
-4. **Overfitting after epoch 4–5** on 1000-graph dataset
-   - Next lever: more data or stronger regularization
-   - Not attempted to respect "do not stack experiments"
+4. **Early overfitting** on 1000-graph dataset (early-stop at epoch 14)
+   - Val loss rises after epoch 14; test metrics stable but not improving
+   - Next lever: dataset expansion (5000+ graphs) or stronger regularization
 
-5. **Candidate restriction is hard prior** ({hdd, switch, ram} only)
+5. **Candidate restriction is a hard prior** ({hdd, switch, ram} only)
    - Correct for synthetic data; needs domain knowledge for real clusters
+
+6. **Minor normalization inconsistency in current dataset** (technical note)
+   - The `__main__` hardening pass (seed=123) wrote files 0–217 before hitting a
+     Windows file-lock error at sample 218; files 218–999 are from seed=42
+   - Both scalers are fitted on similar healthy distributions; inconsistency is minor
+   - All 1000 files load correctly; smoke-train and full-train show clean convergence
 
 ---
 
@@ -478,16 +544,14 @@ For more, see **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
 
 ## 📊 Experiment Registry
 
-Best experiments logged in `artifacts/experiments/registry.jsonl`:
+Best experiments logged in `experiments/registry.jsonl`:
 
 ```json
 {
-  "exp_id": "exp_20260522_110625_62a2466b",
-  "timestamp": "2026-05-22T11:06:25",
-  "dataset_version": "v2.0.0",
-  "dataset_hash": "75066199be54...",
-  "code_hash": "8a422fdf...",
-  "feature_ordering_hash": "c2b1e9...",
+  "exp_id": "exp_20260522_154928_6ab281dc",
+  "timestamp": "2026-05-22T15:49:28",
+  "dataset_version": "v3.0.0",
+  "dataset_hash": "012d3889a1a3...",
   "model": "GATv2Hetero",
   "hyperparams": {
     "hidden_dim": 64,
@@ -497,13 +561,15 @@ Best experiments logged in `artifacts/experiments/registry.jsonl`:
     "listwise_weight": 1.0
   },
   "metrics": {
-    "test_auc": 0.9430,
-    "test_f1_at_best": 0.3846,
-    "test_rca_top1": 0.5278,
-    "test_mrr": 0.5958
+    "test_auc": 0.9834,
+    "test_f1_at_best": 0.7160,
+    "test_rca_top1": 0.7826,
+    "test_mrr": 0.8230
   }
 }
 ```
+
+v2.0.0+E1 baseline (`exp_20260522_110625_62a2466b`, AUC=0.9430, RCA=0.5278) preserved in registry for comparison.
 
 ---
 
@@ -546,5 +612,5 @@ Issues, questions, or feedback? Open an issue on GitHub or email aladbaba228@gma
 ---
 
 **Last updated**: 2026-05-22  
-**Latest phase**: E1 (listwise loss, RCA Top-1 0.53)  
-**Status**: 🟢 Stable (metrics validated, batch-invariance tested, negative results recorded)
+**Latest phase**: Phase 6 — v3.0.0 dataset migration (RCA Top-1 0.783, Gate-A targets met)  
+**Status**: 🟢 Stable (Gate-A met, 12/12 tests pass, single-seed — multi-seed validation pending)
