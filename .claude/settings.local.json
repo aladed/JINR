@@ -8,7 +8,10 @@
       "PowerShell(cd d:\\\\Vlad\\\\JINR; & \"$env:LOCALAPPDATA\\\\Programs\\\\Python\\\\Python311\\\\python.exe\" -c \"import torch; print\\(torch.__version__\\)\" 2>&1 | Select-Object -First 2)",
       "PowerShell(cd d:\\\\Vlad\\\\JINR; Get-ChildItem \"start.py\" | Select -First 1; & \"$env:LOCALAPPDATA\\\\Programs\\\\Python\\\\Python311\\\\Scripts\\\\pip.exe\" show torch 2>&1 | Select -First 3)",
       "PowerShell(conda env list 2>&1)",
-      "PowerShell(python -c \"import ast; ast.parse\\(open\\('d:/Vlad/JINR/training_pipeline/dataset_generator.py'\\).read\\(\\)\\); print\\('AST OK'\\)\")"
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('d:/Vlad/JINR/training_pipeline/dataset_generator.py'\\).read\\(\\)\\); print\\('AST OK'\\)\")",
+      "Bash(python -m py_compile d:\\\\Vlad\\\\JINR\\\\training_pipeline\\\\dataset_generator.py)",
+      "PowerShell(python -m py_compile \"d:\\\\Vlad\\\\JINR\\\\training_pipeline\\\\dataset_generator.py\" -v)",
+      "PowerShell(python -m py_compile \"d:\\\\Vlad\\\\JINR\\\\training_pipeline\\\\dataset_generator.py\")"
     ]
   }
 }

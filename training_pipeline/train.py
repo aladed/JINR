@@ -33,10 +33,31 @@ _ROOT        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATASET_DIR  = os.path.join(_ROOT, "dataset")
 RAW_DIR      = os.path.join(DATASET_DIR, "raw")
 CKPT_DIR     = os.path.join(_ROOT, "checkpoints")
+MANIFEST_DIR     = os.path.join(DATASET_DIR, "manifest")
 METADATA_PATH    = os.path.join(DATASET_DIR, "metadata.json")
 LOSS_CFG_PATH    = os.path.join(DATASET_DIR, "loss_config.json")
 BEST_MODEL_PATH  = os.path.join(CKPT_DIR, "best_model.pt")
 HISTORY_PATH     = os.path.join(CKPT_DIR, "training_history.json")
+
+# Versioning support (optional — training works without manifest present)
+try:
+    from training_pipeline.versioning import (
+        build_checkpoint_versioning_metadata,
+        check_checkpoint_compatibility,
+        get_dataset_hash_from_manifest,
+        get_dataset_version_from_manifest,
+        compute_behavioral_code_hash,
+        compute_feature_ordering_hash,
+    )
+    from training_pipeline.experiment_registry import (
+        new_experiment_id,
+        append_experiment,
+        build_experiment_metadata,
+    )
+    from training_pipeline.config import FEATURE_SCHEMA
+    _VERSIONING_AVAILABLE = True
+except ImportError:
+    _VERSIONING_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
@@ -596,6 +617,25 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # ---- Versioning: load dataset identity --------------------------------
+    _dataset_version = "unknown"
+    _dataset_hash    = "unknown"
+    _dataset_codename = "unknown"
+    _exp_id = None
+
+    if _VERSIONING_AVAILABLE and os.path.exists(MANIFEST_DIR):
+        try:
+            _dataset_hash    = get_dataset_hash_from_manifest(MANIFEST_DIR)
+            _dataset_version = get_dataset_version_from_manifest(MANIFEST_DIR)
+            print(f"Dataset version : {_dataset_version}")
+            print(f"Dataset hash    : {_dataset_hash[:12]}...")
+            _exp_id = new_experiment_id()
+            print(f"Experiment ID   : {_exp_id}")
+        except Exception as e:
+            print(f"[versioning] Warning: could not read manifest: {e}")
+    elif _VERSIONING_AVAILABLE:
+        print("[versioning] No manifest found — running without version tracking")
+
     # ---- Load metadata and loss config ------------------------------------
     with open(METADATA_PATH, encoding="utf-8") as f:
         metadata = json.load(f)
@@ -695,6 +735,27 @@ def main() -> None:
             best_val_f1    = val_f1
             best_epoch     = epoch
             patience_count = 0
+
+            # Build versioning metadata block
+            _versioning_block: Dict = {}
+            if _VERSIONING_AVAILABLE:
+                try:
+                    _versioning_block = build_checkpoint_versioning_metadata(
+                        dataset_version=_dataset_version,
+                        dataset_hash=_dataset_hash,
+                        manifest_dir=MANIFEST_DIR,
+                        feature_schema=FEATURE_SCHEMA,
+                        node_dims=node_dims,
+                        model_config={
+                            "hidden_dim": HIDDEN_DIM,
+                            "heads":      HEADS,
+                            "dropout":    DROPOUT,
+                        },
+                        train_py_path=__file__,
+                    )
+                except Exception as e:
+                    print(f"[versioning] Warning: checkpoint metadata error: {e}")
+
             torch.save(
                 {
                     "epoch":            epoch,
@@ -703,6 +764,8 @@ def main() -> None:
                     "rca_accuracy":     rca_acc,
                     "node_dims":        node_dims,
                     "edge_types":       edge_types,
+                    # --- versioning block ---
+                    **_versioning_block,
                 },
                 BEST_MODEL_PATH,
             )
@@ -720,6 +783,55 @@ def main() -> None:
 
     # ---- Final evaluation on best checkpoint ------------------------------
     evaluate_model(model, val_loader, pos_weights, device, edge_types)
+
+    # ---- Log experiment to registry ----------------------------------------
+    if _VERSIONING_AVAILABLE and _exp_id is not None:
+        try:
+            _train_end = time.time()
+            _final_metrics = history.get("val_roc_auc", [])
+            _code_versions: Dict[str, str] = {}
+            try:
+                _code_versions["train_code_hash"] = compute_behavioral_code_hash(__file__)
+                _code_versions["feature_ordering_hash"] = compute_feature_ordering_hash(FEATURE_SCHEMA)
+            except Exception:
+                pass
+
+            exp_meta = build_experiment_metadata(
+                exp_id=_exp_id,
+                dataset_version=_dataset_version,
+                dataset_hash=_dataset_hash,
+                dataset_codename=_dataset_codename,
+                model_config={
+                    "model_type": "HeteroGATv2",
+                    "hidden_dim":  HIDDEN_DIM,
+                    "heads":       HEADS,
+                    "dropout":     DROPOUT,
+                },
+                loss_config=loss_cfg.get("pos_weight", {}),
+                optimizer_config={"optimizer": "AdamW", "lr": LR, "weight_decay": WEIGHT_DECAY},
+                training_config={
+                    "epochs":      EPOCHS,
+                    "batch_size":  BATCH_SIZE,
+                    "patience":    PATIENCE,
+                    "train_ratio": TRAIN_RATIO,
+                    "seed":        SEED,
+                    "device":      str(device),
+                },
+                metrics={
+                    "best_val_f1":          best_val_f1,
+                    "best_epoch":           best_epoch,
+                    "final_val_roc_auc":    _final_metrics[-1] if _final_metrics else None,
+                    "final_rca_accuracy":   history.get("rca_accuracy", [None])[-1],
+                },
+                runtime={"checkpoint_path": BEST_MODEL_PATH},
+                code_versions=_code_versions,
+                checkpoint_path=BEST_MODEL_PATH,
+                status="completed",
+            )
+            append_experiment(exp_meta)
+            print(f"Experiment logged -> experiments/registry.jsonl  [{_exp_id}]")
+        except Exception as e:
+            print(f"[versioning] Warning: could not log experiment: {e}")
 
 
 if __name__ == "__main__":

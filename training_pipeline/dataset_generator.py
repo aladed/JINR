@@ -1652,14 +1652,15 @@ _CATEGORICAL_CARDINALITY: int = 2
 def _compute_final_dim(node_type: str) -> Tuple[int, int, int]:
     """Return (final_dim, num_continuous, num_categorical) for a node type.
 
-    final_dim = num_continuous * 3 + num_categorical * _CATEGORICAL_CARDINALITY
+    final_dim = num_continuous * 4 + num_categorical * _CATEGORICAL_CARDINALITY
+    (4 = value, delta_short, delta_long, rolling_var)
     """
     if node_type not in FEATURE_SCHEMA:
         return 1, 0, 0
     cont_idx, cat_idx = _classify_features(node_type)
     num_cont = len(cont_idx)
     num_cat  = len(cat_idx)
-    final_dim = num_cont * 3 + num_cat * _CATEGORICAL_CARDINALITY
+    final_dim = num_cont * 4 + num_cat * _CATEGORICAL_CARDINALITY
     return final_dim, num_cont, num_cat
 
 
@@ -2064,6 +2065,18 @@ import json
 import os
 import time
 
+# Versioning support (optional import — generation still works without it)
+try:
+    from training_pipeline.versioning import (
+        compute_semantic_dataset_hash,
+        compute_feature_ordering_hash,
+        write_dataset_manifest,
+        run_dataset_sanity_checks,
+    )
+    _VERSIONING_AVAILABLE = True
+except ImportError:
+    _VERSIONING_AVAILABLE = False
+
 NUM_DATASET_SAMPLES: int = 1000
 HEALTHY_RATIO: float = 0.70
 DATASET_DIR: str = "dataset"
@@ -2270,7 +2283,126 @@ def generate_dataset(
         f"\nGeneration complete: {num_samples} samples in {total_time:.1f}s "
         f"({total_time / num_samples:.3f}s/sample)"
     )
+
+    # ---- Write versioning manifest (if versioning module available) ----------
+    if _VERSIONING_AVAILABLE:
+        _write_generation_manifest(
+            dataset_dir=dataset_dir,
+            num_samples=num_samples,
+            healthy_count=healthy_count,
+            base_seed=base_seed,
+        )
+
+    # ---- Write metadata and loss config (for training compatibility) ---------
+    save_dataset_metadata(
+        scaler_stats=scaler_stats,
+        num_samples=num_samples,
+        healthy_ratio=healthy_ratio,
+        base_seed=base_seed,
+        dataset_dir=dataset_dir,
+    )
+    save_loss_config(
+        scaler_stats=scaler_stats,
+        num_samples=num_samples,
+        healthy_ratio=healthy_ratio,
+        dataset_dir=dataset_dir,
+    )
+
     return scaler_stats
+
+
+def _write_generation_manifest(
+    dataset_dir: str,
+    num_samples: int,
+    healthy_count: int,
+    base_seed: int,
+) -> None:
+    """Build semantic config and write the full modular manifest."""
+    from training_pipeline.config import (
+        EMA_ALPHA,
+        FAULT_INJECTION_STEP,
+        FEATURE_SCHEMA,
+        NUM_HOSTS,
+        NUM_LEAF,
+        NUM_SPINE,
+        SIMULATION_STEPS,
+    )
+
+    semantic_config = {
+        "topology": {
+            "NUM_HOSTS": NUM_HOSTS,
+            "NUM_LEAF":  NUM_LEAF,
+            "NUM_SPINE": NUM_SPINE,
+        },
+        "temporal": {
+            "SIMULATION_STEPS":     SIMULATION_STEPS,
+            "FAULT_INJECTION_STEP": FAULT_INJECTION_STEP,
+            "EMA_ALPHA":            EMA_ALPHA,
+            "NOISE_SCALE":          _NOISE_SCALE,
+            "DRIFT_AMP":            _DRIFT_AMP,
+            "DRIFT_PERIOD":         _DRIFT_PERIOD,
+            "temporal_channels":    ["value", "delta_short", "delta_long", "rolling_var"],
+        },
+        "fault": {
+            "fault_types":      FAULT_TYPES,
+            "severity_min":     0.15,
+            "severity_max":     0.45,
+            "propagation_algo": "phase2_bfs_temporal_activation",
+        },
+        "seeds": {
+            "master_seed": base_seed,
+        },
+        "feature_schema_version": "v2.0",
+    }
+
+    dataset_hash = compute_semantic_dataset_hash(semantic_config)
+
+    # Build node_dims from current FEATURE_SCHEMA
+    node_dims: Dict[str, int] = {}
+    for nt in NODE_TYPES:
+        if nt == "rca_context":
+            node_dims[nt] = 1
+        else:
+            fd, _, _ = _compute_final_dim(nt)
+            node_dims[nt] = fd
+
+    # Edge types list
+    from training_pipeline.config import (
+        CONTEXT_EDGE_TYPES, LOGICAL_EDGE_TYPES, PHYSICAL_EDGE_TYPES,
+    )
+    all_edge_types = (
+        list(PHYSICAL_EDGE_TYPES)
+        + list(LOGICAL_EDGE_TYPES)
+        + list(CONTEXT_EDGE_TYPES)
+    )
+
+    manifest_dir = os.path.join(dataset_dir, "manifest")
+
+    write_dataset_manifest(
+        manifest_dir=manifest_dir,
+        dataset_version="v2.0.0",
+        dataset_hash=dataset_hash,
+        codename="phase2_causal_propagation",
+        semantic_config=semantic_config,
+        feature_schema={k: list(v) for k, v in FEATURE_SCHEMA.items()},
+        total_graphs=num_samples,
+        healthy_graphs=healthy_count,
+        node_dims=node_dims,
+        edge_types=all_edge_types,
+        previous_version="v1.0.0",
+        changelog=(
+            "Phase-2 hardening: BFS temporal propagation, rolling variance channel, "
+            "cross-type signatures, healthy transient spikes"
+        ),
+        breaking_changes=[
+            "Temporal tensor expanded from [N,F,3] to [N,F,4] (added rolling_var)",
+            "Feature dimensionality per node increased (~33%)",
+            "Checkpoints from v1.x incompatible with v2.x",
+        ],
+    )
+
+    print(f"Manifest written -> {manifest_dir}/")
+    print(f"  dataset_hash = {dataset_hash}")
 
 
 def save_dataset_metadata(
@@ -3941,7 +4073,7 @@ if __name__ == "__main__":
             print(f"    {nt:<14}  dim=1  (virtual)")
         else:
             fd, nc, ncat = _compute_final_dim(nt)
-            print(f"    {nt:<14}  dim={fd}  (cont={nc}x3, cat={ncat}x{_CATEGORICAL_CARDINALITY})")
+            print(f"    {nt:<14}  dim={fd}  (cont={nc}x4, cat={ncat}x{_CATEGORICAL_CARDINALITY})")
     print()
     print("Step 7 PASSED.")
 
