@@ -1,9 +1,9 @@
 {
   "dataset_identity": {
-    "codename": "phase4_ram_cpu_propagation",
-    "dataset_hash": "75066199be54df75d58e5d9395e94141e6ee4c8526f01ab911610a5ff5f09ff9",
-    "generation_timestamp": "2026-05-22T11:40:11.084923+00:00",
-    "semantic_version": "v2.1.0"
+    "codename": "v3_targeted_migration",
+    "dataset_hash": "012d3889a1a37bdd32b89eb53dfa6ee6d4fb3076c4e86991db0bfebdb2541eab",
+    "generation_timestamp": "2026-05-22T15:30:09.815443+00:00",
+    "semantic_version": "v3.0.0"
   },
   "manifest_schema_version": "v2.0"
 }

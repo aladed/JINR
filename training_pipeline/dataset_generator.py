@@ -258,6 +258,7 @@ def build_edge_indices(
 def build_edge_attr(
     edge_indices: Dict[EdgeType, torch.Tensor],
     rng: Optional[np.random.Generator] = None,
+    fault_plan: Optional[Dict] = None,
 ) -> Dict[EdgeType, torch.Tensor]:
     """Return {edge_type: edge_attr} tensors.
 
@@ -294,6 +295,24 @@ def build_edge_attr(
             attrs[edge_type] = torch.ones(
                 num_edges, EDGE_DIM_DUMMY, dtype=torch.float32
             )
+
+    # Change 4: enrich physical link attrs with fault state for network_congestion
+    if fault_plan is not None and fault_plan.get("fault_type") == "network_congestion":
+        rc_switch = fault_plan["rc_node_id"]
+        amp       = fault_plan["severity"] * 0.55
+        fwd_et    = ("cpu", "connected_to", "switch")
+        rev_et    = ("switch", "rev_connected_to_cpu", "cpu")
+        for et, switch_row in [(fwd_et, 1), (rev_et, 0)]:
+            if et not in attrs:
+                continue
+            ei = edge_indices[et]
+            ea = attrs[et].clone()
+            for idx in (ei[switch_row] == rc_switch).nonzero(as_tuple=True)[0].tolist():
+                atten      = float(rng.uniform(0.3, 0.7)) if rng is not None else 0.5
+                ea[idx, 0] += amp * atten        # link_bandwidth_usage_percent
+                ea[idx, 1] += amp * atten * 0.5  # link_latency_ms
+                ea[idx, 2] += amp * 0.3          # link_packet_loss_percent
+            attrs[et] = ea.clamp(0.0, 1.0)
 
     return attrs
 
@@ -531,7 +550,7 @@ def simulate_healthy_trajectory(
 
         # ---- run simulation steps ----------------------------------------
         prev_cont = cont_init.clone()
-        cont_history: deque = deque(maxlen=5)
+        cont_history: deque = deque(maxlen=10)
         cont_history.append(prev_cont.clone())
 
         for step in range(1, SIMULATION_STEPS):
@@ -642,7 +661,7 @@ def _resolve_fault_plan(
 
     all_anomalies: [(node_type, node_id, feat_idx, total_amplitude, direction, activation_step)]
     """
-    _host_to_leaf, leaf_to_hosts, _job_to_host, host_to_jobs = routing_maps
+    _host_to_leaf, _leaf_to_spines, _job_to_host, host_to_jobs = routing_maps
 
     # --- RC node selection ---
     if fault_type == "hdd_degradation":
@@ -747,7 +766,7 @@ def _resolve_fault_plan(
         all_anomalies.append(
             ("switch", rc_switch, tx_idx, amp * float(rng.uniform(0.2, 0.6)), +1.0, rc_act))
 
-        affected_hosts = leaf_to_hosts.get(rc_switch, [])
+        affected_hosts = [h for h in range(NUM_HOSTS) if _host_to_leaf[h] == rc_switch]
 
         iowait_idx  = _feat_idx("cpu", "cpu_iowait_percent")
         pcie_tx_idx = _feat_idx("gpu", "gpu_pcie_tx_mb")
@@ -800,34 +819,58 @@ def _resolve_fault_plan(
         }
 
     # -----------------------------------------------------------------------
-    else:  # ram_leak
+    else:  # ram_leak — multi-phase causal simulation (v3.0)
         rc_host = rc_node_id
 
-        used_idx = _feat_idx("ram", "ram_used_percent")
-        frag_idx = _feat_idx("ram", "ram_fragmentation_score")
-        pf_idx   = _feat_idx("ram", "ram_page_faults_ps")
-        rc_noise = float(rng.normal(0.0, 0.025))
+        _max_act = SIMULATION_STEPS - 1  # cap so steps_remaining >= 1
 
+        # Feature indices
+        pf_idx     = _feat_idx("ram", "ram_page_faults_ps")
+        used_idx   = _feat_idx("ram", "ram_used_percent")
+        frag_idx   = _feat_idx("ram", "ram_fragmentation_score")
+        cached_idx = _feat_idx("ram", "ram_cached_mb")
+        swap_idx   = _feat_idx("ram", "ram_swap_used_percent")
+        lat_idx    = _feat_idx("ram", "ram_latency_ns")
+        sys_idx    = _feat_idx("cpu", "cpu_system_percent")
+
+        # Phase 1 — rc_act (step 50): page faults lead before usage saturates
+        all_anomalies.append(
+            ("ram", rc_host, pf_idx, amp * 0.90, +1.0, rc_act)
+        )
+
+        # Phase 2 — rc_act + 5 (step 55): usage + fragmentation
+        phase2_act = min(rc_act + 5, _max_act)
         all_anomalies += [
-            ("ram", rc_host, used_idx, amp + rc_noise, +1.0, rc_act),
-            ("ram", rc_host, frag_idx, amp * 0.65,     +1.0, rc_act),
-            ("ram", rc_host, pf_idx,   amp * 0.80,     +1.0, rc_act),
+            ("ram", rc_host, used_idx, amp * 1.0,  +1.0, phase2_act),
+            ("ram", rc_host, frag_idx, amp * 0.60, +1.0, phase2_act),
         ]
 
-        # Downstream CPU: memory pressure -> kernel reclaim / swap overhead.
-        # Phase-4 fix: structural corroboration for the RC ram node, matching
-        # hdd_degradation (see artifacts/phase5_ram_diagnostic.md).
-        sys_idx = _feat_idx("cpu", "cpu_system_percent")
+        # Phase 3 — rc_act + 10 (step 60): cache eviction (INVERSE) + CPU reclaim
+        phase3_act = min(rc_act + 10, _max_act)
+        all_anomalies.append(
+            ("ram", rc_host, cached_idx, amp * 0.55, -1.0, phase3_act)  # cache shrinks
+        )
         victim_cpus_rl: List[int] = []
-        if rng.random() < 0.70:
+        if rng.random() < 0.80:
             victim_cpus_rl.append(rc_host)
-            atten   = float(rng.uniform(0.15, 0.9))
-            noise_v = float(rng.normal(0.0, 0.05))
-            act_cpu = activation_step_for("cpu", rc_host)
-            all_anomalies.append(("cpu", rc_host, sys_idx,
-                                  amp * 0.6 * atten + noise_v, +1.0, act_cpu))
+            all_anomalies.append(
+                ("cpu", rc_host, sys_idx, amp * 0.65, +1.0, phase3_act)
+            )
 
-        ram_idx     = _feat_idx("job", "job_ram_usage_percent")
+        # Phase 4 — rc_act + 25 (step 75): swap activation + elevated latency
+        phase4_act = min(rc_act + 25, _max_act)
+        if rng.random() < 0.70:
+            all_anomalies.append(
+                ("ram", rc_host, swap_idx, amp * 1.10, +1.0, phase4_act)
+            )
+        if rng.random() < 0.60:
+            all_anomalies.append(
+                ("ram", rc_host, lat_idx, amp * 0.45, +1.0, phase4_act)
+            )
+
+        # Job victims — rc_act + 28 (step 78): OOM-pressure degradation
+        job_act_base = min(rc_act + 28, _max_act)
+        ram_j_idx   = _feat_idx("job", "job_ram_usage_percent")
         wait_idx    = _feat_idx("job", "job_wait_time_seconds")
         runtime_idx = _feat_idx("job", "job_runtime_seconds")
 
@@ -835,11 +878,11 @@ def _resolve_fault_plan(
         for jid in host_to_jobs.get(rc_host, []):
             if rng.random() < 0.55:
                 victim_jobs_rl.append(jid)
-                v_amp   = amp * float(rng.uniform(0.25, 1.05))
-                act_job = activation_step_for("job", jid)
+                v_amp   = amp * float(rng.uniform(0.30, 1.10))
+                act_job = max(activation_step_for("job", jid), job_act_base)
                 all_anomalies += [
-                    ("job", jid, ram_idx,     v_amp * 0.8,  +1.0, act_job),
-                    ("job", jid, wait_idx,    v_amp * 0.5,  +1.0, act_job),
+                    ("job", jid, ram_j_idx,   v_amp * 0.85, +1.0, act_job),
+                    ("job", jid, wait_idx,    v_amp * 0.50, +1.0, act_job),
                     ("job", jid, runtime_idx, v_amp * 0.35, +1.0, act_job),
                 ]
 
@@ -934,7 +977,7 @@ def simulate_trajectory_with_fault(
         keeper = TemporalStateKeeper(full_init)
         last_temporal = keeper.step(full_init)
         prev_cont = cont_init.clone()
-        cont_history: deque = deque(maxlen=5)
+        cont_history: deque = deque(maxlen=10)
         cont_history.append(prev_cont.clone())
 
         for step in range(1, SIMULATION_STEPS):
@@ -2102,7 +2145,7 @@ DATASET_DIR: str = "dataset"
 RAW_DIR: str = os.path.join(DATASET_DIR, "raw")
 
 # Number of healthy graphs used to fit the global scaler before generation
-_SCALER_FIT_SAMPLES: int = 10
+_SCALER_FIT_SAMPLES: int = 100
 
 
 def _make_dataset_dirs() -> None:
@@ -2196,9 +2239,9 @@ def generate_dataset(
         # Per-sample edge structures (unique link state per graph)
         edge_rng     = np.random.default_rng(int(rng.integers(0, 2**31)))
         edge_indices = build_edge_indices(h2l, l2s, j2h)
-        edge_attrs   = build_edge_attr(edge_indices, rng=edge_rng)
 
         if is_healthy:
+            edge_attrs = build_edge_attr(edge_indices, rng=edge_rng)
             traj      = simulate_healthy_trajectory(seed=sample_seed)
             spike_rng = np.random.default_rng(int(rng.integers(0, 2**31)))
             traj      = _add_transient_spikes_healthy(traj, spike_rng)
@@ -2229,6 +2272,7 @@ def generate_dataset(
 
             # Resolve stochastic fault parameters (no state mutation yet)
             plan = _resolve_fault_plan(fault_type, severity, routing_maps, fault_rng)
+            edge_attrs = build_edge_attr(edge_indices, rng=edge_rng, fault_plan=plan)
 
             # Simulate with fault ramped inside the loop (fixes delta_short)
             temporal_state = simulate_trajectory_with_fault(plan, seed=sample_seed)
@@ -2366,12 +2410,12 @@ def _write_generation_manifest(
             "fault_types":      FAULT_TYPES,
             "severity_min":     0.15,
             "severity_max":     0.45,
-            "propagation_algo": "phase4_ram_cpu_propagation",
+            "propagation_algo": "v3_targeted_migration",
         },
         "seeds": {
             "master_seed": base_seed,
         },
-        "feature_schema_version": "v2.0",
+        "feature_schema_version": "v3.0",
     }
 
     dataset_hash = compute_semantic_dataset_hash(semantic_config)
@@ -2399,25 +2443,31 @@ def _write_generation_manifest(
 
     write_dataset_manifest(
         manifest_dir=manifest_dir,
-        dataset_version="v2.1.0",
+        dataset_version="v3.0.0",
         dataset_hash=dataset_hash,
-        codename="phase4_ram_cpu_propagation",
+        codename="v3_targeted_migration",
         semantic_config=semantic_config,
         feature_schema={k: list(v) for k, v in FEATURE_SCHEMA.items()},
         total_graphs=num_samples,
         healthy_graphs=healthy_count,
         node_dims=node_dims,
         edge_types=all_edge_types,
-        previous_version="v2.0.0",
+        previous_version="v2.1.0",
         changelog=(
-            "Phase-4 data fix: ram_leak now propagates to the host CPU "
-            "(cpu_system_percent), matching hdd_degradation and "
-            "network_congestion. Removes the structural asymmetry where ram "
-            "root causes had no anomalous neighbour. Feature schema unchanged."
+            "v3.0.0 targeted migration (4 changes): "
+            "(1) Fix leaf_to_hosts routing bug — network_congestion now affects ~25 hosts "
+            "instead of 2 spine IDs. "
+            "(2) Temporal SNR fix — EMA_ALPHA 0.0645→0.030, rolling_var maxlen 5→10, "
+            "_SCALER_FIT_SAMPLES 10→100. "
+            "(3) ram_leak multi-phase causal redesign — 6 features across 4 phases "
+            "(page_faults→used+frag→cached↓+cpu_system→swap+latency→jobs). "
+            "(4) network_congestion edge enrichment — physical link attrs for "
+            "cpu↔rc_switch edges elevated in bandwidth, latency, packet_loss."
         ),
         breaking_changes=[
-            "Fault distribution changed (ram_leak propagation) - metrics are "
-            "not directly comparable to v2.0.0; retraining required.",
+            "routing bug fix changes network_congestion fault distribution — "
+            "metrics not comparable to v2.x; full retraining required.",
+            "ram_leak temporal structure changed — v2.x checkpoints are stale.",
         ],
     )
 
