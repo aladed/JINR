@@ -253,8 +253,8 @@ def mode_fast(exp: Dict, imports: Dict) -> bool:
             for nt, pw in loss_cfg.get("pos_weight", {}).items()
         }
 
-        _, val_loader = build_dataloaders(
-            num_total=num_total, train_ratio=0.80, batch_size=4, seed=42
+        _, val_loader, _ = build_dataloaders(
+            num_total=num_total, batch_size=4, seed=42
         )
 
         state = torch.load(ckpt_path, map_location=device, weights_only=False)

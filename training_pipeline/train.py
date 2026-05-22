@@ -71,7 +71,8 @@ WEIGHT_DECAY = 1e-4
 EPOCHS       = 30
 BATCH_SIZE   = 4
 PATIENCE     = 5
-TRAIN_RATIO  = 0.80
+TRAIN_RATIO  = 0.70
+VAL_RATIO    = 0.15
 SEED         = 42
 
 EDGE_DIM_PHYSICAL = 19
@@ -114,22 +115,29 @@ def build_dataloaders(
     train_ratio: float = TRAIN_RATIO,
     batch_size: int = BATCH_SIZE,
     seed: int = SEED,
-) -> Tuple[DataLoader, DataLoader]:
-    """Split indices deterministically and return train/val DataLoaders."""
+    val_ratio: float = VAL_RATIO,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Deterministic 3-way split -> (train, val, test) DataLoaders.
+
+    The seed and permutation are unchanged from the original 80/20 split, so
+    the test slice perm[n_train+n_val:] is a strict subset of the original
+    validation region perm[800:]. A checkpoint trained on the old 80% split
+    has therefore never seen the new test set — no train/test leakage.
+    """
     rng = torch.Generator()
     rng.manual_seed(seed)
     perm = torch.randperm(num_total, generator=rng).tolist()
 
     n_train = int(num_total * train_ratio)
+    n_val   = int(num_total * val_ratio)
     train_idx = perm[:n_train]
-    val_idx   = perm[n_train:]
+    val_idx   = perm[n_train:n_train + n_val]
+    test_idx  = perm[n_train + n_val:]
 
-    train_ds = RCADataset(train_idx)
-    val_ds   = RCADataset(val_idx)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader
+    train_loader = DataLoader(RCADataset(train_idx), batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(RCADataset(val_idx),   batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(RCADataset(test_idx),  batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +665,7 @@ def main() -> None:
     print(f"Edge types: {len(edge_types)}")
 
     # ---- DataLoaders -------------------------------------------------------
-    train_loader, val_loader = build_dataloaders(
+    train_loader, val_loader, test_loader = build_dataloaders(
         num_total=num_total,
         train_ratio=TRAIN_RATIO,
         batch_size=BATCH_SIZE,
@@ -665,7 +673,8 @@ def main() -> None:
     )
     print(
         f"Train: {len(train_loader.dataset)} graphs  |  "
-        f"Val: {len(val_loader.dataset)} graphs"
+        f"Val: {len(val_loader.dataset)} graphs  |  "
+        f"Test: {len(test_loader.dataset)} graphs (held out)"
     )
 
     # ---- Model -------------------------------------------------------------
