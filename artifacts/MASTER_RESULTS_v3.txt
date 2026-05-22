@@ -191,3 +191,14 @@ v3.0.0 is substantially more reliable and interpretable.
 READY FOR DEPLOYMENT or next research phase.
 
 ================================================================================
+
+================================================================================
+HIT@K METRICS (computed post-training, same test split)
+================================================================================
+
+Overall (150 faulted graphs):
+  Hit@1: 0.7826   (= RCA Top-1, sanity check OK)
+  Hit@3: 0.8261
+  Hit@5: 0.8696
+
+Note: Hit@3=0.826 is below the thesis claim of ~0.94.
