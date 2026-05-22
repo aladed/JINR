@@ -6,6 +6,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
+
 from llm.prompt_builder import build_incident_id, format_rc_node
 from llm.response_parser import extract_json_object
 
@@ -152,7 +154,7 @@ def generate_rule_based_playbook(inference: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class LLMClient:
-    """Try ollama, then transformers; fall back to rule-based generator."""
+    """Try Ollama/Mistral first; fall back to rule-based generator."""
 
     def __init__(
         self,
@@ -182,7 +184,7 @@ class LLMClient:
             if raw:
                 parsed = extract_json_object(raw)
                 if parsed:
-                    return parsed, "ollama"
+                    return parsed, "ollama_mistral"
 
         if self.enable_transformers:
             raw = self._try_transformers(messages)
@@ -195,15 +197,16 @@ class LLMClient:
         return generate_rule_based_playbook(inference), "rule_based_fallback"
 
     def _try_ollama(self, messages: List[Dict[str, str]]) -> Optional[str]:
-        try:
-            import ollama
+        prompt = self._messages_to_prompt(messages)
+        return call_ollama_http(prompt, model=self.ollama_model, timeout=60)
 
-            client = ollama.Client(timeout=5.0)
-            response = client.chat(model=self.ollama_model, messages=messages)
-            return response.get("message", {}).get("content", "")
-        except Exception as exc:
-            logger.debug("Ollama unavailable: %s", exc)
-            return None
+    def _messages_to_prompt(self, messages: List[Dict[str, str]]) -> str:
+        parts = []
+        for message in messages:
+            role = message.get("role", "user").upper()
+            content = message.get("content", "")
+            parts.append(f"{role}:\n{content}")
+        return "\n\n".join(parts)
 
     def _try_transformers(self, messages: List[Dict[str, str]]) -> Optional[str]:
         try:
@@ -222,3 +225,19 @@ class LLMClient:
         except Exception as exc:
             logger.debug("Transformers unavailable: %s", exc)
         return None
+
+
+def call_ollama_http(prompt: str, model: str = "mistral", timeout: int = 60) -> Optional[str]:
+    """Call local Ollama HTTP API; more reliable for cold starts than CLI chat."""
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:11434/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("response", "")
+        logger.debug("Ollama HTTP status %s: %s", resp.status_code, resp.text)
+    except Exception as exc:
+        print(f"Ollama HTTP error: {exc}")
+    return None

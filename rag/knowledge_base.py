@@ -102,6 +102,71 @@ Scope: Monotonic RSS growth, swap thrashing, OOM killer events.
 Escalation: Repeated leaks from same binary → NOTIFY_OPERATOR with binary hash and module list.
 """.strip()
 
+SLURM_SCONTROL_NODE_DOC_SOP = """
+Source: https://slurm.schedmd.com/scontrol.html
+Extracted with requests + BeautifulSoup from the scontrol documentation.
+
+Relevant NodeName command examples and interpretation:
+
+1. scontrol show node
+   - The documentation lists "scontrol show node" as a show command for node
+     state inspection. Use it before remediation to confirm node state, job
+     allocation, drain flags, and scheduler-visible health.
+
+2. scontrol update NodeName=<nodes> State={POWER_UP|POWER_DOWN|POWER_DOWN_ASAP|POWER_DOWN_FORCE}
+   - The documentation marks this as prior usage superseded by the power
+     subcommand, but it remains a useful SOP reference for interpreting node
+     power remediation state.
+   - POWER_DOWN_ASAP drains nodes first: currently running jobs complete, and
+     no additional jobs are allocated to the nodes.
+   - POWER_DOWN_FORCE cancels jobs, powers nodes down, and resets state to IDLE.
+
+3. delete NodeName=<nodelist>
+   - NodeName is a node name or node list. Only dynamic nodes with no running
+     jobs and not part of a reservation can be deleted.
+   - Multiple node names may use ranges such as lx[10-20].
+
+Operational use in remediation:
+   - Before ISOLATE_NODE or MIGRATE_JOB, inspect node state with scontrol show
+     node and prefer drain/ASAP semantics over forceful cancellation.
+   - For network congestion affecting compute hosts, avoid destructive node
+     changes while MPI jobs are active; drain future allocations first.
+""".strip()
+
+CUMULUS_MONITORING_DOC_SOP = """
+Source: https://docs.nvidia.com/networking-ethernet-software/cumulus-linux/Monitoring-and-Troubleshooting/
+Extracted with requests + BeautifulSoup from the Cumulus Linux monitoring page.
+
+Relevant monitoring commands found on the page:
+
+1. nv show system
+   - Shows switch uptime, hostname, product name, health status, product
+     release, system MAC, and related system identity fields.
+
+2. nv show system memory
+   - Shows physical memory total/free/buffer/cache/used/utilization and swap
+     totals. Use it to check whether switch control-plane pressure is
+     contributing to telemetry gaps or delayed remediation.
+
+3. nv show system cpu
+   - Shows CPU model, core count, total utilization, load averages, and per-core
+     utilization.
+
+4. nv show platform
+   - Shows platform inventory such as manufacturer, CPU, memory, serial number,
+     ASIC model, UUID, and system type.
+
+5. cl-support
+   - The documentation describes generating a cl-support export for diagnostics
+     and support requests.
+
+Extraction note:
+   - The fetched static page did not expose literal "show interface counters"
+     examples. Keep the manual network SOP counters (SNMP ifHCInOctets,
+     ifHCOutOctets, buffer drops, PFC pause frames, sFlow/NetFlow) as the
+     interface-counter fallback for network_congestion remediation.
+""".strip()
+
 
 SOP_CHUNKS: List[SOPChunk] = [
     SOPChunk(
@@ -155,6 +220,20 @@ SOP_CHUNKS: List[SOPChunk] = [
             "and monitor swap usage until MemAvailable recovers above 15%."
         ),
         tags=["oom", "escalation"],
+    ),
+    SOPChunk(
+        chunk_id="slurm-doc-001",
+        fault_type="ram_leak",
+        title="SLURM scontrol NodeName remediation commands",
+        text=SLURM_SCONTROL_NODE_DOC_SOP,
+        tags=["slurm", "scontrol", "NodeName", "drain", "scheduler"],
+    ),
+    SOPChunk(
+        chunk_id="net-doc-001",
+        fault_type="network_congestion",
+        title="Cumulus Linux monitoring commands",
+        text=CUMULUS_MONITORING_DOC_SOP,
+        tags=["cumulus", "switch", "monitoring", "nv", "cl-support"],
     ),
 ]
 

@@ -18,6 +18,8 @@ Given GNN root-cause analysis and SOP excerpts, produce a remediation playbook a
 Allowed action_id values (use only these): {ALLOWED_ACTIONS_STR}
 priority: 1=critical, 2=high, 3=normal
 estimated_ttr_seconds: realistic seconds for each step
+Use the exact confidence value from the incident payload. Do not use logits as confidence.
+Every action priority MUST be one of 1, 2, or 3. Never output 4 or 5.
 
 Output JSON schema:
 {{
@@ -38,6 +40,7 @@ Output JSON schema:
 }}
 
 Return ONLY valid JSON. No markdown. Order actions by priority (critical first).
+If unsure, prefer NOTIFY_OPERATOR over actions outside the allowed list.
 """
 
 

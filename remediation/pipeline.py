@@ -24,7 +24,43 @@ from remediation.models import RemediationPlaybook
 
 def load_inference(path: Path) -> Dict[str, Any]:
     with path.open(encoding="utf-8") as f:
-        return json.load(f)
+        return normalize_inference(json.load(f))
+
+
+def normalize_inference(inference: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt GNN branch artifacts to the RAG pipeline input contract."""
+    normalized = dict(inference)
+
+    if "rc_node" not in normalized and isinstance(normalized.get("true_rc"), dict):
+        true_rc = normalized["true_rc"]
+        normalized["rc_node"] = {
+            "type": true_rc.get("node_type", "unknown"),
+            "id": true_rc.get("label", true_rc.get("node_id", "unknown")),
+            "host_id": true_rc.get("node_id"),
+        }
+
+    if "confidence" not in normalized:
+        normalized["confidence"] = normalized.get("rc_score", 0.0)
+
+    if "top5_candidates" not in normalized and "top5" in normalized:
+        normalized["top5_candidates"] = normalized.get("top5", [])
+
+    if "victim_nodes" not in normalized:
+        victim_nodes = []
+        for node_id in normalized.get("cpu_victim_ids", []):
+            victim_nodes.append({"id": f"cpu-{node_id}", "type": "host", "subsystem": "cpu"})
+        for node_id in normalized.get("gpu_victim_ids", []):
+            victim_nodes.append({"id": f"gpu-{node_id}", "type": "host", "subsystem": "gpu"})
+        # CPU/GPU lists describe the same affected hosts for network incidents.
+        if normalized.get("cpu_victim_ids") and normalized.get("gpu_victim_ids"):
+            unique_ids = sorted(set(normalized.get("cpu_victim_ids", [])))
+            victim_nodes = [
+                {"id": f"host-{node_id:03d}", "type": "host"}
+                for node_id in unique_ids
+            ]
+        normalized["victim_nodes"] = victim_nodes
+
+    return normalized
 
 
 def build_retrieval_query(inference: Dict[str, Any]) -> str:
@@ -53,6 +89,7 @@ def run_pipeline(
         (playbook, metadata) where metadata includes firewall_status, backend, etc.
     """
     total_start = time.perf_counter()
+    inference = normalize_inference(inference)
     fault_type = inference.get("fault_type", "unknown")
     graph_id = inference.get("graph_id", 0)
     confidence = float(inference.get("confidence", 0.0))
@@ -137,6 +174,7 @@ def run_pipeline(
         "ttr_breakdown": ttr_breakdown,
         "firewall_status": firewall_status,
         "firewall_error": err,
+        "llm_source": backend,
         "llm_backend": backend,
         "rule_based_fallback": backend == "rule_based_fallback"
         or raw_playbook.get("rule_based_fallback", False),
@@ -163,6 +201,7 @@ def remediation_report_payload(playbook: RemediationPlaybook, metadata: Dict[str
         "playbook": playbook_to_dict(playbook),
         "ttr_breakdown": metadata["ttr_breakdown"],
         "firewall_status": metadata["firewall_status"],
+        "llm_source": metadata.get("llm_source"),
         "llm_backend": metadata.get("llm_backend"),
         "rule_based_fallback": metadata.get("rule_based_fallback", False),
     }
