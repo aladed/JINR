@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
+*.pyo
 artifacts/remediation_report.json
 artifacts/inference_sample.json

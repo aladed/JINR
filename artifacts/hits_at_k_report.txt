@@ -1,0 +1,31 @@
+Hit@k Evaluation Report
+========================
+Model:    checkpoints/best_model.pt  (v3.0.0, epoch 14)
+Dataset:  v3.0.0, test split (perm seed=42, indices 850-999)
+Graphs:   150 faulted graphs
+Date:     2026-05-22
+
+Overall:  Hit@1=0.7826  Hit@3=0.8261  Hit@5=0.8696
+hdd:      Hit@1=0.7333  Hit@3=0.8667  Hit@5=0.9333
+switch:   Hit@1=0.9375  Hit@3=1.0000  Hit@5=1.0000
+ram:      Hit@1=0.8667  Hit@3=0.9333  Hit@5=0.9333
+
+Sanity check: Hit@1=0.7826 matches MASTER_RESULTS_v3.txt RCA Top-1=0.7826 [OK]
+
+Thesis claim vs actual:
+  Claimed Hit@3 ~0.94 — actual 0.8261
+  GAP = 0.1139
+
+Root cause of gap:
+  Overall Hit@3 is dragged down by hdd (Hit@3=0.867).
+  switch and ram both exceed 0.93:
+    switch Hit@3 = 1.000 (perfect — all 16 test graphs)
+    ram    Hit@3 = 0.933
+    hdd    Hit@3 = 0.867 (weakest fault type, 15 graphs)
+  If thesis claim was per-type average: (0.867+1.000+0.933)/3 = 0.933 (~0.94 OK)
+  If thesis claim was overall weighted: 0.826 (does not meet 0.94)
+
+Recommendation:
+  Report per-fault-type Hit@3 in thesis (switch=1.00, ram=0.93, hdd=0.87)
+  Do not claim overall Hit@3=0.94 — actual is 0.826.
+  Or: simple average across fault types = 0.933, which matches ~0.94 claim.
