@@ -16,6 +16,7 @@ No normalization, tensor flattening, serialization, or training loop.
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -485,11 +486,12 @@ def simulate_healthy_trajectory(
     """Simulate SIMULATION_STEPS of healthy cluster telemetry.
 
     Returns:
-        Dict[node_type, torch.Tensor]  shape [num_nodes, num_features, 3]
+        Dict[node_type, torch.Tensor]  shape [num_nodes, num_features, 4]
         The tensor represents the LAST timestep's temporal state.
         [:, :, 0] = current value
         [:, :, 1] = delta_short
         [:, :, 2] = delta_long
+        [:, :, 3] = rolling_var over last 5 steps (continuous features only; 0 for categorical)
 
     rca_context is excluded (virtual node, no telemetry schema).
     """
@@ -512,7 +514,6 @@ def simulate_healthy_trajectory(
 
         # ---- initialise continuous state --------------------------------
         cont_init = _make_initial_continuous(node_type, num_nodes, num_cont, rng)
-        # Full feature tensor (continuous slots only at first)
         full_init = torch.zeros(num_nodes, num_feats, dtype=torch.float32)
         if num_cont > 0:
             for out_pos, feat_pos in enumerate(cont_idx):
@@ -530,9 +531,10 @@ def simulate_healthy_trajectory(
 
         # ---- run simulation steps ----------------------------------------
         prev_cont = cont_init.clone()
+        cont_history: deque = deque(maxlen=5)
+        cont_history.append(prev_cont.clone())
 
         for step in range(1, SIMULATION_STEPS):
-            # Smooth Gaussian noise + slow sinusoidal drift
             noise = torch.from_numpy(
                 rng.normal(0.0, _NOISE_SCALE, size=(num_nodes, num_cont))
                 .astype(np.float32)
@@ -542,6 +544,7 @@ def simulate_healthy_trajectory(
             )
             new_cont = prev_cont + noise + drift_offset
             new_cont = new_cont.clamp(0.0, 1.0)
+            cont_history.append(new_cont.clone())
 
             # Categorical: rare state flip (p=0.02 per feature per step)
             new_cat: torch.Tensor | None = None
@@ -549,13 +552,11 @@ def simulate_healthy_trajectory(
                 flip_mask = torch.from_numpy(
                     (rng.random(size=(num_nodes, num_cat)) < 0.02).astype(np.float32)
                 )
-                # Retrieve current categorical values from keeper's prev
                 cur_cat = torch.zeros(num_nodes, num_cat, dtype=torch.float32)
                 for out_pos, feat_pos in enumerate(cat_idx):
                     cur_cat[:, out_pos] = keeper._prev_value[:, feat_pos]
                 new_cat = torch.abs(cur_cat - flip_mask).clamp(0.0, 1.0)
 
-            # Assemble full feature tensor for this step
             full_step = torch.zeros(num_nodes, num_feats, dtype=torch.float32)
             if num_cont > 0:
                 for out_pos, feat_pos in enumerate(cont_idx):
@@ -567,7 +568,14 @@ def simulate_healthy_trajectory(
             last_temporal = keeper.step(full_step)
             prev_cont = new_cont
 
-        result[node_type] = last_temporal  # [num_nodes, num_feats, 3]
+        # ---- rolling_var: channel 3 (continuous features only) ----------
+        rolling_var = torch.stack(list(cont_history)).var(dim=0)  # [N, num_cont]
+        out4 = torch.zeros(num_nodes, num_feats, 4, dtype=torch.float32)
+        out4[:, :, :3] = last_temporal
+        for out_pos, feat_pos in enumerate(cont_idx):
+            out4[:, feat_pos, 3] = rolling_var[:, out_pos]
+
+        result[node_type] = out4  # [num_nodes, num_feats, 4]
 
     return result
 
@@ -589,9 +597,9 @@ def validate_temporal_tensor(
             raise ValueError(
                 f"[{node_type}] expected 3-dim tensor, got {t.dim()}"
             )
-        if t.shape[2] != 3:
+        if t.shape[2] != 4:
             raise ValueError(
-                f"[{node_type}] last dim must be 3 (value/delta_short/delta_long), "
+                f"[{node_type}] last dim must be 4 (value/delta_short/delta_long/rolling_var), "
                 f"got {t.shape[2]}"
             )
         expected_nodes = NODE_COUNTS[node_type]
@@ -629,23 +637,48 @@ def _resolve_fault_plan(
 ) -> Dict:
     """Pre-determine all stochastic fault decisions without touching any state.
 
-    Returns a plan dict containing:
-        fault_type, rc_node_type, rc_node_id, severity,
-        all_anomalies : [(node_type, node_id, feat_idx, total_amplitude, direction)]
-        victim_node_ids : Dict[str, List[int]]
-        y_dict, loss_mask_dict  -- labels ready for HeteroData assembly.
+    Phase-2: uses BFS graph distances to assign per-victim activation times
+    (TruncExp hop delays), making topology and temporal causality essential.
 
-    all_anomalies encodes the TOTAL intended shift for each (node, feature) pair.
-    simulate_trajectory_with_fault() distributes this shift across the fault
-    window (steps 50–89) so delta_short stays realistic at each step.
+    all_anomalies: [(node_type, node_id, feat_idx, total_amplitude, direction, activation_step)]
     """
-    host_to_leaf, _, job_to_host, host_to_jobs = routing_maps
+    _host_to_leaf, leaf_to_hosts, _job_to_host, host_to_jobs = routing_maps
 
-    all_anomalies: List[Tuple] = []  # (node_type, node_id, feat_idx, amp, direction)
-
+    # --- RC node selection ---
     if fault_type == "hdd_degradation":
-        rc_host = int(rng.integers(0, NUM_HOSTS))
-        amp = severity * 0.55
+        rc_node_type = "hdd"
+        rc_node_id   = int(rng.integers(0, NUM_HOSTS))
+        amp          = severity * 0.55
+    elif fault_type == "network_congestion":
+        rc_node_type = "switch"
+        rc_node_id   = int(rng.integers(0, NUM_LEAF))
+        amp          = severity * 0.55
+    else:  # ram_leak
+        rc_node_type = "ram"
+        rc_node_id   = int(rng.integers(0, NUM_HOSTS))
+        amp          = severity * 0.50
+
+    # --- BFS distances from RC node ---
+    distances = _compute_graph_distances(rc_node_type, rc_node_id, routing_maps, max_depth=3)
+
+    def activation_step_for(ntype: str, nid: int) -> int:
+        """Convert hop distance → activation step using TruncExp delays."""
+        dist = distances.get((ntype, nid), 0)
+        delay = 0.0
+        for _ in range(dist):
+            delay += _sample_truncated_exp(rng, lam=0.15, max_val=10.0)
+        return int(FAULT_INJECTION_STEP + min(delay, SIMULATION_STEPS - FAULT_INJECTION_STEP - 1))
+
+    # RC node itself activates at FAULT_INJECTION_STEP
+    rc_act = FAULT_INJECTION_STEP
+
+    all_anomalies: List[Tuple] = []  # 6-tuple: (nt, nid, fi, amp, dir, activation_step)
+
+    victim_node_ids: Dict[str, List[int]] = {}
+
+    # -----------------------------------------------------------------------
+    if fault_type == "hdd_degradation":
+        rc_host = rc_node_id
 
         lat_idx = _feat_idx("hdd", "disk_latency_ms")
         sec_idx = _feat_idx("hdd", "disk_reallocated_sectors")
@@ -653,43 +686,47 @@ def _resolve_fault_plan(
         rc_noise = float(rng.normal(0.0, 0.03))
 
         all_anomalies += [
-            ("hdd", rc_host, lat_idx, amp + rc_noise, +1.0),
-            ("hdd", rc_host, sec_idx, amp * 0.8,      +1.0),
-            ("hdd", rc_host, use_idx, amp * 0.4,      +1.0),
+            ("hdd", rc_host, lat_idx, amp + rc_noise, +1.0, rc_act),
+            ("hdd", rc_host, sec_idx, amp * 0.8,      +1.0, rc_act),
+            ("hdd", rc_host, use_idx, amp * 0.4,      +1.0, rc_act),
         ]
 
-        victim_cpus: List[int] = []
-        iowait_idx = _feat_idx("cpu", "cpu_iowait_percent")
-        if rng.random() < 0.70:
-            victim_cpus.append(rc_host)
-            atten = float(rng.uniform(0.15, 0.9))
-            noise_v = float(rng.normal(0.0, 0.05))
-            all_anomalies.append(("cpu", rc_host, iowait_idx,
-                                  amp * 0.6 * atten + noise_v, +1.0))
+        # Cross-type contamination (15–25%): occasionally bleed disk signature onto RAM
+        if rng.random() < 0.20:
+            frag_idx = _feat_idx("ram", "ram_fragmentation_score")
+            all_anomalies.append(("ram", rc_host, frag_idx, amp * 0.15, +1.0, rc_act))
 
+        iowait_idx  = _feat_idx("cpu", "cpu_iowait_percent")
         wait_idx    = _feat_idx("job", "job_wait_time_seconds")
         runtime_idx = _feat_idx("job", "job_runtime_seconds")
         io_r_idx    = _feat_idx("job", "job_io_read_mb")
+
+        victim_cpus: List[int] = []
+        if rng.random() < 0.70:
+            victim_cpus.append(rc_host)
+            atten  = float(rng.uniform(0.15, 0.9))
+            noise_v = float(rng.normal(0.0, 0.05))
+            act_cpu = activation_step_for("cpu", rc_host)
+            all_anomalies.append(("cpu", rc_host, iowait_idx,
+                                  amp * 0.6 * atten + noise_v, +1.0, act_cpu))
+
         actual_victim_jobs: List[int] = []
         for jid in host_to_jobs.get(rc_host, []):
             if rng.random() < 0.60:
                 actual_victim_jobs.append(jid)
-                v_amp = amp * float(rng.uniform(0.3, 1.1))
+                v_amp   = amp * float(rng.uniform(0.3, 1.1))
+                act_job = activation_step_for("job", jid)
                 all_anomalies += [
-                    ("job", jid, wait_idx,    v_amp * 0.9, +1.0),
-                    ("job", jid, runtime_idx, v_amp * 0.5, +1.0),
-                    ("job", jid, io_r_idx,    v_amp * 0.4, -1.0),
+                    ("job", jid, wait_idx,    v_amp * 0.9, +1.0, act_job),
+                    ("job", jid, runtime_idx, v_amp * 0.5, +1.0, act_job),
+                    ("job", jid, io_r_idx,    v_amp * 0.4, -1.0, act_job),
                 ]
 
-        victim_node_ids: Dict[str, List[int]] = {
-            "cpu": victim_cpus, "job": actual_victim_jobs,
-        }
-        rc_node_type = "hdd"
-        rc_node_id   = rc_host
+        victim_node_ids = {"cpu": victim_cpus, "job": actual_victim_jobs}
 
+    # -----------------------------------------------------------------------
     elif fault_type == "network_congestion":
-        rc_switch = int(rng.integers(0, NUM_LEAF))
-        amp = severity * 0.55
+        rc_switch = rc_node_id
 
         pkt_idx = _feat_idx("switch", "switch_packet_loss_percent")
         lat_idx = _feat_idx("switch", "switch_latency_ms")
@@ -700,17 +737,17 @@ def _resolve_fault_plan(
         if rng.random() < 0.80:
             all_anomalies.append(
                 ("switch", rc_switch, pkt_idx,
-                 amp + float(rng.normal(0, 0.03)), +1.0))
+                 amp + float(rng.normal(0, 0.03)), +1.0, rc_act))
         if rng.random() < 0.75:
-            all_anomalies.append(("switch", rc_switch, lat_idx, amp * 0.9, +1.0))
+            all_anomalies.append(("switch", rc_switch, lat_idx, amp * 0.9, +1.0, rc_act))
         if rng.random() < 0.60:
-            all_anomalies.append(("switch", rc_switch, bw_idx,  amp * 0.7, +1.0))
+            all_anomalies.append(("switch", rc_switch, bw_idx,  amp * 0.7, +1.0, rc_act))
         all_anomalies.append(
-            ("switch", rc_switch, rx_idx, amp * float(rng.uniform(0.2, 0.6)), +1.0))
+            ("switch", rc_switch, rx_idx, amp * float(rng.uniform(0.2, 0.6)), +1.0, rc_act))
         all_anomalies.append(
-            ("switch", rc_switch, tx_idx, amp * float(rng.uniform(0.2, 0.6)), +1.0))
+            ("switch", rc_switch, tx_idx, amp * float(rng.uniform(0.2, 0.6)), +1.0, rc_act))
 
-        affected_hosts = [h for h in range(NUM_HOSTS) if host_to_leaf[h] == rc_switch]
+        affected_hosts = leaf_to_hosts.get(rc_switch, [])
 
         iowait_idx  = _feat_idx("cpu", "cpu_iowait_percent")
         pcie_tx_idx = _feat_idx("gpu", "gpu_pcie_tx_mb")
@@ -724,38 +761,47 @@ def _resolve_fault_plan(
         victim_jobs_nc: List[int] = []
 
         for h in affected_hosts:
-            if rng.random() < 0.55:
+            compat_cpu = _get_node_type_compatibility(fault_type, "cpu")
+            if rng.random() < 0.55 * compat_cpu:
                 victim_cpus_nc.append(h)
-                atten = float(rng.uniform(0.1, 0.8))
-                nv    = float(rng.normal(0.0, 0.06))
+                atten   = float(rng.uniform(0.1, 0.8))
+                nv      = float(rng.normal(0.0, 0.06))
+                act_cpu = activation_step_for("cpu", h)
                 all_anomalies.append(("cpu", h, iowait_idx,
-                                      amp * 0.5 * atten + nv, +1.0))
-            if rng.random() < 0.50:
+                                      amp * 0.5 * atten + nv, +1.0, act_cpu))
+                # Cross-type: occasionally affect cpu_temperature alongside network signal
+                if rng.random() < 0.15:
+                    temp_idx = _feat_idx("cpu", "cpu_temperature_celsius")
+                    all_anomalies.append(("cpu", h, temp_idx, amp * 0.10, +1.0, act_cpu))
+
+            compat_gpu = _get_node_type_compatibility(fault_type, "gpu")
+            if rng.random() < 0.50 * compat_gpu:
                 victim_gpus_nc.append(h)
-                atten = float(rng.uniform(0.1, 0.7))
+                atten   = float(rng.uniform(0.1, 0.7))
+                act_gpu = activation_step_for("gpu", h)
                 all_anomalies += [
-                    ("gpu", h, pcie_tx_idx, amp * 0.35 * atten, -1.0),
-                    ("gpu", h, pcie_rx_idx, amp * 0.35 * atten, -1.0),
+                    ("gpu", h, pcie_tx_idx, amp * 0.35 * atten, -1.0, act_gpu),
+                    ("gpu", h, pcie_rx_idx, amp * 0.35 * atten, -1.0, act_gpu),
                 ]
+
             for jid in host_to_jobs.get(h, []):
                 if rng.random() < 0.50:
                     victim_jobs_nc.append(jid)
-                    v_amp = amp * float(rng.uniform(0.2, 1.0))
+                    v_amp   = amp * float(rng.uniform(0.2, 1.0))
+                    act_job = activation_step_for("job", jid)
                     all_anomalies += [
-                        ("job", jid, net_rx_idx, v_amp * 0.5, -1.0),
-                        ("job", jid, net_tx_idx, v_amp * 0.5, -1.0),
-                        ("job", jid, wait_idx,   v_amp * 0.6, +1.0),
+                        ("job", jid, net_rx_idx, v_amp * 0.5, -1.0, act_job),
+                        ("job", jid, net_tx_idx, v_amp * 0.5, -1.0, act_job),
+                        ("job", jid, wait_idx,   v_amp * 0.6, +1.0, act_job),
                     ]
 
         victim_node_ids = {
             "cpu": victim_cpus_nc, "gpu": victim_gpus_nc, "job": victim_jobs_nc,
         }
-        rc_node_type = "switch"
-        rc_node_id   = rc_switch
 
+    # -----------------------------------------------------------------------
     else:  # ram_leak
-        rc_host = int(rng.integers(0, NUM_HOSTS))
-        amp = severity * 0.50
+        rc_host = rc_node_id
 
         used_idx = _feat_idx("ram", "ram_used_percent")
         frag_idx = _feat_idx("ram", "ram_fragmentation_score")
@@ -763,30 +809,35 @@ def _resolve_fault_plan(
         rc_noise = float(rng.normal(0.0, 0.025))
 
         all_anomalies += [
-            ("ram", rc_host, used_idx, amp + rc_noise, +1.0),
-            ("ram", rc_host, frag_idx, amp * 0.65,     +1.0),
-            ("ram", rc_host, pf_idx,   amp * 0.80,     +1.0),
+            ("ram", rc_host, used_idx, amp + rc_noise, +1.0, rc_act),
+            ("ram", rc_host, frag_idx, amp * 0.65,     +1.0, rc_act),
+            ("ram", rc_host, pf_idx,   amp * 0.80,     +1.0, rc_act),
         ]
+
+        # Cross-type: ram leak occasionally shows mild cpu_iowait signature
+        if rng.random() < 0.20:
+            iowait_idx = _feat_idx("cpu", "cpu_iowait_percent")
+            all_anomalies.append(("cpu", rc_host, iowait_idx, amp * 0.12, +1.0, rc_act))
 
         ram_idx     = _feat_idx("job", "job_ram_usage_percent")
         wait_idx    = _feat_idx("job", "job_wait_time_seconds")
         runtime_idx = _feat_idx("job", "job_runtime_seconds")
+
         victim_jobs_rl: List[int] = []
         for jid in host_to_jobs.get(rc_host, []):
             if rng.random() < 0.55:
                 victim_jobs_rl.append(jid)
-                v_amp = amp * float(rng.uniform(0.25, 1.05))
+                v_amp   = amp * float(rng.uniform(0.25, 1.05))
+                act_job = activation_step_for("job", jid)
                 all_anomalies += [
-                    ("job", jid, ram_idx,     v_amp * 0.8,  +1.0),
-                    ("job", jid, wait_idx,    v_amp * 0.5,  +1.0),
-                    ("job", jid, runtime_idx, v_amp * 0.35, +1.0),
+                    ("job", jid, ram_idx,     v_amp * 0.8,  +1.0, act_job),
+                    ("job", jid, wait_idx,    v_amp * 0.5,  +1.0, act_job),
+                    ("job", jid, runtime_idx, v_amp * 0.35, +1.0, act_job),
                 ]
 
         victim_node_ids = {"job": victim_jobs_rl}
-        rc_node_type = "ram"
-        rc_node_id   = rc_host
 
-    # Build y_dict and loss_mask_dict (same structure as existing inject_fault)
+    # --- Labels ---
     y_dict: Dict[str, torch.Tensor] = {}
     loss_mask_dict: Dict[str, torch.Tensor] = {}
     for nt in NODE_TYPES:
@@ -803,14 +854,14 @@ def _resolve_fault_plan(
         loss_mask_dict[nt] = mask
 
     return {
-        "fault_type":           fault_type,
-        "rc_node_type":         rc_node_type,
-        "rc_node_id":           rc_node_id,
-        "severity":             severity,
-        "all_anomalies":        all_anomalies,
-        "victim_node_ids":      victim_node_ids,
-        "y_dict":               y_dict,
-        "loss_mask_dict":       loss_mask_dict,
+        "fault_type":      fault_type,
+        "rc_node_type":    rc_node_type,
+        "rc_node_id":      rc_node_id,
+        "severity":        severity,
+        "all_anomalies":   all_anomalies,   # 6-tuples
+        "victim_node_ids": victim_node_ids,
+        "y_dict":          y_dict,
+        "loss_mask_dict":  loss_mask_dict,
     }
 
 
@@ -834,13 +885,13 @@ def simulate_trajectory_with_fault(
         seed       : RNG seed for healthy noise/drift (per-sample)
 
     Returns:
-        Dict[node_type, Tensor[N, F, 3]] — final temporal state at step 89.
+        Dict[node_type, Tensor[N, F, 4]] — final temporal state at step 89.
+        Channel 3 = rolling_var over last 5 steps (continuous features only).
     """
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
-    all_anomalies  = fault_plan["all_anomalies"]
-    fault_steps    = max(1, SIMULATION_STEPS - FAULT_INJECTION_STEP)  # 40
+    all_anomalies = fault_plan["all_anomalies"]
 
     result: Dict[str, torch.Tensor] = {}
 
@@ -855,13 +906,11 @@ def simulate_trajectory_with_fault(
         num_cont = len(cont_idx)
         num_cat  = len(cat_idx)
 
-        # Map raw feature index → compact continuous column index
         feat_to_compact: Dict[int, int] = {fi: pos for pos, fi in enumerate(cont_idx)}
 
-        # Anomalies for this node type as (node_id, compact_col, total_amp, direction)
         nt_anomalies = [
-            (nid, feat_to_compact[fi], amp, d)
-            for (nt, nid, fi, amp, d) in all_anomalies
+            (nid, feat_to_compact[fi], amp, d, act)
+            for (nt, nid, fi, amp, d, act) in all_anomalies
             if nt == node_type and fi in feat_to_compact
         ]
 
@@ -877,6 +926,8 @@ def simulate_trajectory_with_fault(
         keeper = TemporalStateKeeper(full_init)
         last_temporal = keeper.step(full_init)
         prev_cont = cont_init.clone()
+        cont_history: deque = deque(maxlen=5)
+        cont_history.append(prev_cont.clone())
 
         for step in range(1, SIMULATION_STEPS):
             noise = torch.from_numpy(
@@ -888,13 +939,16 @@ def simulate_trajectory_with_fault(
             )
             new_cont = prev_cont + noise + drift_offset
 
-            # Fault ramp: distribute total_amplitude evenly across fault_steps
-            if step >= FAULT_INJECTION_STEP and nt_anomalies:
-                for (nid, compact_fi, total_amp, direction) in nt_anomalies:
-                    per_step = direction * total_amp / fault_steps
-                    new_cont[nid, compact_fi] = new_cont[nid, compact_fi] + per_step
+            # Fault ramp: each anomaly activates at its own BFS-derived step
+            if nt_anomalies:
+                for (nid, compact_fi, total_amp, direction, activation_step) in nt_anomalies:
+                    if step >= activation_step:
+                        steps_remaining = max(1, SIMULATION_STEPS - activation_step)
+                        per_step = direction * total_amp / steps_remaining
+                        new_cont[nid, compact_fi] = new_cont[nid, compact_fi] + per_step
 
             new_cont = new_cont.clamp(0.0, 1.0)
+            cont_history.append(new_cont.clone())
 
             new_cat: Optional[torch.Tensor] = None
             if num_cat > 0:
@@ -916,13 +970,19 @@ def simulate_trajectory_with_fault(
             last_temporal = keeper.step(full_step)
             prev_cont = new_cont
 
-        result[node_type] = last_temporal
+        rolling_var = torch.stack(list(cont_history)).var(dim=0)  # [N, num_cont]
+        out4 = torch.zeros(num_nodes, num_feats, 4, dtype=torch.float32)
+        out4[:, :, :3] = last_temporal
+        for out_pos, feat_pos in enumerate(cont_idx):
+            out4[:, feat_pos, 3] = rolling_var[:, out_pos]
+
+        result[node_type] = out4
 
     return result
 
 # Named tuple-style dataclass replaced with plain Dict for zero extra imports.
 # FaultResult keys:
-#   temporal_state : Dict[str, torch.Tensor]  -- modified copy, shape [N, F, 3]
+#   temporal_state : Dict[str, torch.Tensor]  -- modified copy, shape [N, F, 4]
 #   y_dict         : Dict[str, torch.Tensor]  -- RCA labels,   shape [N]
 #   loss_mask_dict : Dict[str, torch.Tensor]  -- bool mask,    shape [N]
 #   fault_type     : str
@@ -937,6 +997,94 @@ FaultResult = Dict  # type alias for readability
 def _feat_idx(node_type: str, name: str) -> int:
     """Return the column index of *name* in FEATURE_SCHEMA[node_type]."""
     return FEATURE_SCHEMA[node_type].index(name)
+
+
+def _sample_truncated_exp(rng: np.random.Generator, lam: float, max_val: float) -> float:
+    """Sample from Exponential(lam) truncated to [0, max_val]."""
+    u = rng.random()
+    # Inverse CDF of truncated exponential
+    val = -np.log(1.0 - u * (1.0 - np.exp(-lam * max_val))) / lam
+    return float(np.clip(val, 0.0, max_val))
+
+
+def _compute_graph_distances(
+    rc_type: str,
+    rc_id: int,
+    routing_maps: Tuple[Dict, Dict, Dict, Dict],
+    max_depth: int = 3,
+) -> Dict[Tuple[str, int], int]:
+    """BFS from (rc_type, rc_id) through the physical topology.
+
+    Returns {(node_type, node_id): hop_distance} for all reachable nodes
+    within max_depth hops (excluding the RC node itself).
+    """
+    host_to_leaf, leaf_to_hosts, job_to_host, host_to_jobs = routing_maps
+
+    # Build adjacency: (node_type, node_id) -> [(neighbor_type, neighbor_id)]
+    def neighbors(ntype: str, nid: int) -> List[Tuple[str, int]]:
+        nbrs: List[Tuple[str, int]] = []
+        if ntype == "hdd":
+            nbrs.append(("cpu", nid))          # hdd→cpu on same host
+        elif ntype == "ram":
+            nbrs.append(("cpu", nid))          # ram→cpu on same host
+        elif ntype == "cpu":
+            nbrs.append(("hdd", nid))
+            nbrs.append(("ram", nid))
+            nbrs.append(("gpu", nid))
+            leaf = host_to_leaf.get(nid)
+            if leaf is not None:
+                nbrs.append(("switch", leaf))
+            for jid in host_to_jobs.get(nid, []):
+                nbrs.append(("job", jid))
+        elif ntype == "gpu":
+            nbrs.append(("cpu", nid))
+        elif ntype == "switch":
+            # leaf→hosts
+            for h in leaf_to_hosts.get(nid, []):
+                nbrs.append(("cpu", h))
+                nbrs.append(("gpu", h))
+            # leaf↔spine (switch ids NUM_LEAF..NUM_LEAF+NUM_SPINE-1)
+            if nid < NUM_LEAF:
+                for spine in range(NUM_LEAF, NUM_LEAF + NUM_SPINE):
+                    nbrs.append(("switch", spine))
+            else:
+                for leaf in range(NUM_LEAF):
+                    nbrs.append(("switch", leaf))
+        elif ntype == "job":
+            host = job_to_host.get(nid)
+            if host is not None:
+                nbrs.append(("cpu", host))
+        return nbrs
+
+    visited: Dict[Tuple[str, int], int] = {}
+    queue: deque = deque()
+    start = (rc_type, rc_id)
+    queue.append((start, 0))
+    visited[start] = 0
+
+    while queue:
+        (ntype, nid), dist = queue.popleft()
+        if dist >= max_depth:
+            continue
+        for (nbr_type, nbr_id) in neighbors(ntype, nid):
+            key = (nbr_type, nbr_id)
+            if key not in visited:
+                visited[key] = dist + 1
+                queue.append((key, dist + 1))
+
+    # Remove the RC node itself
+    visited.pop(start, None)
+    return visited
+
+
+def _get_node_type_compatibility(fault_type: str, node_type: str) -> float:
+    """Multiplicative factor for cross-type victim selection probability."""
+    matrix: Dict[str, Dict[str, float]] = {
+        "hdd_degradation":   {"hdd": 1.0, "cpu": 0.7, "ram": 0.3, "gpu": 0.2, "switch": 0.1, "job": 0.6},
+        "network_congestion":{"switch": 1.0, "cpu": 0.5, "gpu": 0.4, "job": 0.5, "ram": 0.2, "hdd": 0.1},
+        "ram_leak":          {"ram": 1.0, "cpu": 0.6, "job": 0.7, "gpu": 0.2, "hdd": 0.1, "switch": 0.05},
+    }
+    return matrix.get(fault_type, {}).get(node_type, 0.1)
 
 
 def _ramp(step: int, total_steps: int, severity: float) -> float:
@@ -1023,6 +1171,53 @@ def _add_healthy_outliers(
                         dtype=torch.float32,
                     )
         out[nt] = t
+    return out
+
+
+def _add_transient_spikes_healthy(
+    state: Dict[str, torch.Tensor],
+    rng: np.random.Generator,
+    spike_prob: float = 0.04,
+    spike_scale: float = 0.10,
+    n_burst_nodes: int = 3,
+) -> Dict[str, torch.Tensor]:
+    """Inject hard-negative transient spikes into healthy graphs.
+
+    Spikes look locally anomalous but are spatially isolated (no propagation),
+    forcing the model to use multi-hop context to distinguish true RC from noise.
+    """
+    out = {k: v.clone() for k, v in state.items()}
+
+    # Per-feature independent Bernoulli spikes across all nodes
+    for nt in NODE_TYPES:
+        if nt == "rca_context":
+            continue
+        t = out[nt]
+        n, f, _ = t.shape
+        mask = rng.random(size=(n, f)) < spike_prob
+        signs = rng.choice([-1.0, 1.0], size=(n, f))
+        magnitudes = rng.uniform(spike_scale * 0.5, spike_scale * 1.5, size=(n, f)).astype(np.float32)
+        for ni in range(n):
+            for fi in range(f):
+                if mask[ni, fi]:
+                    delta = float(signs[ni, fi]) * float(magnitudes[ni, fi])
+                    t[ni, fi, 0] = (t[ni, fi, 0] + delta).clamp(0.0, 1.0)
+                    # Reflect spike in delta_short channel too
+                    t[ni, fi, 1] = t[ni, fi, 1] + delta * 0.5
+        out[nt] = t
+
+    # Concentrated burst: pick a few random nodes with multi-feature spikes
+    for _ in range(n_burst_nodes):
+        nt = rng.choice([x for x in NODE_TYPES if x != "rca_context"])
+        n, f, _ = out[nt].shape
+        nid = int(rng.integers(0, n))
+        n_feats = max(1, int(rng.integers(1, min(4, f) + 1)))
+        feat_ids = rng.choice(f, size=n_feats, replace=False)
+        for fi in feat_ids:
+            delta = float(rng.uniform(0.08, 0.18)) * float(rng.choice([-1, 1]))
+            out[nt][nid, fi, 0] = (out[nt][nid, fi, 0] + delta).clamp(0.0, 1.0)
+            out[nt][nid, fi, 1] = out[nt][nid, fi, 1] + delta * 0.5
+
     return out
 
 
@@ -1488,13 +1683,13 @@ def build_final_node_features(
     """Assemble final 2-D node feature tensors from temporal state.
 
     Assembly policy (Variant A):
-        - Continuous features: expand to [value, delta_short, delta_long] → 3 cols each
+        - Continuous features: expand to [value, delta_short, delta_long, rolling_var] → 4 cols each
         - Categorical features: take value channel only → one-hot → 2 cols each
         - Concat order: [continuous_expanded | categorical_one_hot]
 
     Args:
-        temporal_state: Dict[node_type, Tensor[N, F, 3]]
-                        Output of simulate_healthy_trajectory() or inject_fault().
+        temporal_state: Dict[node_type, Tensor[N, F, 4]]
+                        Output of simulate_healthy_trajectory() or simulate_trajectory_with_fault().
 
     Returns:
         Dict[node_type, Tensor[N, FINAL_DIM]]  -- float32, 2-D, no NaN/Inf.
@@ -1972,9 +2167,11 @@ def generate_dataset(
         edge_attrs   = build_edge_attr(edge_indices, rng=edge_rng)
 
         if is_healthy:
-            traj   = simulate_healthy_trajectory(seed=sample_seed)
-            xd     = build_final_node_features(traj)
-            norm_x = normalize_features(xd, scaler_stats)
+            traj      = simulate_healthy_trajectory(seed=sample_seed)
+            spike_rng = np.random.default_rng(int(rng.integers(0, 2**31)))
+            traj      = _add_transient_spikes_healthy(traj, spike_rng)
+            xd        = build_final_node_features(traj)
+            norm_x    = normalize_features(xd, scaler_stats)
 
             y_dict: Dict[str, torch.Tensor] = {
                 nt: torch.zeros(NODE_COUNTS[nt], dtype=torch.long)
@@ -2923,6 +3120,120 @@ def run_dataset_diagnostics(
 
     print(f"  Estimated task difficulty               : {difficulty}")
 
+    # ---- [9] LEAKAGE DIAGNOSTICS (Phase-2) ---------------------------------
+    print(f"\n[9] LEAKAGE DIAGNOSTICS")
+
+    # 9a. Node-type-alone prediction: can node type predict RC without features?
+    # Baseline: always predict the majority node type as RC
+    nt_label_counts: Dict[str, int] = {}
+    nt_total = 0
+    for g in faulted_graphs:
+        for nt in NODE_TYPES:
+            if nt == "rca_context":
+                continue
+            if hasattr(g[nt], "y") and int(g[nt].y.sum().item()) > 0:
+                nt_label_counts[nt] = nt_label_counts.get(nt, 0) + 1
+                nt_total += 1
+
+    if nt_total > 0:
+        majority_nt = max(nt_label_counts, key=lambda k: nt_label_counts[k])
+        nt_acc = nt_label_counts[majority_nt] / nt_total
+        print(f"  9a. Node-type-alone RC accuracy : {nt_acc:.3f}  (majority='{majority_nt}')")
+        if nt_acc > 0.70:
+            warnings_list.append(
+                f"WARNING [9a]: node-type alone predicts RC at {nt_acc:.2f} — potential type-leakage"
+            )
+    else:
+        print("  9a. Node-type-alone test: no faulted graphs")
+
+    # 9b. Graph-distance-alone: are RC nodes systematically closer to some hub?
+    # Compute average hop from switch[0] for RC nodes vs non-RC nodes in faulted graphs
+    rc_feat_vals: List[float] = []
+    nonrc_feat_vals: List[float] = []
+    for g in faulted_graphs[:min(30, len(faulted_graphs))]:
+        for nt in ["hdd", "ram", "cpu", "switch"]:
+            if not hasattr(g[nt], "y") or not hasattr(g[nt], "x"):
+                continue
+            y_np = g[nt].y.numpy()
+            x_np = g[nt].x.float().numpy()
+            # Use first feature value (normalised) as proxy for "distance from hub"
+            rc_mask = y_np == 1
+            if rc_mask.any():
+                rc_feat_vals.extend(x_np[rc_mask, 0].tolist())
+            nonrc_feat_vals.extend(x_np[~rc_mask, 0].tolist())
+
+    if rc_feat_vals and nonrc_feat_vals:
+        rc_mean   = float(np.mean(rc_feat_vals))
+        nonrc_mean = float(np.mean(nonrc_feat_vals))
+        feat_diff = abs(rc_mean - nonrc_mean)
+        print(f"  9b. RC vs non-RC feature[0] mean diff : {feat_diff:.4f}  (RC={rc_mean:.4f}, nonRC={nonrc_mean:.4f})")
+        if feat_diff > 0.15:
+            warnings_list.append(
+                f"WARNING [9b]: RC nodes differ from non-RC by {feat_diff:.3f} in feature[0] — possible shortcut"
+            )
+
+    # 9c. Kendall τ for healthy graphs < 0.15: ensure label-feature decorrelation
+    if healthy_graphs:
+        try:
+            from scipy.stats import kendalltau
+            tau_vals: List[float] = []
+            for g in healthy_graphs[:min(20, len(healthy_graphs))]:
+                for nt in NODE_TYPES:
+                    if nt == "rca_context" or not hasattr(g[nt], "x"):
+                        continue
+                    x_np = g[nt].x.float().numpy()
+                    y_np = np.zeros(x_np.shape[0])  # all healthy → label=0
+                    if x_np.shape[0] < 4:
+                        continue
+                    tau, _ = kendalltau(x_np[:, 0], y_np)
+                    if not np.isnan(tau):
+                        tau_vals.append(abs(float(tau)))
+            if tau_vals:
+                mean_tau = float(np.mean(tau_vals))
+                print(f"  9c. Mean |Kendall τ| healthy graphs   : {mean_tau:.4f}  (target < 0.15)")
+                if mean_tau > 0.15:
+                    warnings_list.append(
+                        f"WARNING [9c]: healthy-graph Kendall τ = {mean_tau:.3f} > 0.15 — label-feature correlation"
+                    )
+        except ImportError:
+            print("  9c. Kendall τ: scipy not available — skipping")
+
+    # 9d. Temporal-channel leakage: do delta_short values alone separate RC from healthy?
+    rc_ds_vals: List[float] = []
+    healthy_ds_vals: List[float] = []
+    for g in faulted_graphs[:20]:
+        for nt in NODE_TYPES:
+            if nt == "rca_context" or not hasattr(g[nt], "x") or not hasattr(g[nt], "y"):
+                continue
+            x = g[nt].x.float()
+            y = g[nt].y
+            if x.shape[1] < 2:
+                continue
+            # delta_short for continuous features starts at col 1 (every 4th col after)
+            ds_col = x[:, 1]
+            rc_mask = (y == 1)
+            if rc_mask.any():
+                rc_ds_vals.extend(ds_col[rc_mask].tolist())
+            healthy_ds_vals.extend(ds_col[~rc_mask].tolist())
+
+    for g in healthy_graphs[:20]:
+        for nt in NODE_TYPES:
+            if nt == "rca_context" or not hasattr(g[nt], "x"):
+                continue
+            x = g[nt].x.float()
+            if x.shape[1] >= 2:
+                healthy_ds_vals.extend(x[:, 1].tolist())
+
+    if rc_ds_vals and healthy_ds_vals:
+        rc_ds_mean      = float(np.mean(np.abs(rc_ds_vals)))
+        healthy_ds_mean = float(np.mean(np.abs(healthy_ds_vals)))
+        ds_ratio = rc_ds_mean / max(healthy_ds_mean, 1e-8)
+        print(f"  9d. |delta_short| ratio RC/healthy     : {ds_ratio:.2f}  (target 1–5x, not >10x)")
+        if ds_ratio > 10.0:
+            warnings_list.append(
+                f"WARNING [9d]: delta_short ratio {ds_ratio:.1f}x — temporal channel may be trivially leaking RC"
+            )
+
     # ---- Optional plots ----------------------------------------------------
     if _MATPLOTLIB_AVAILABLE:
         plots_dir = os.path.join(dataset_dir, "plots")
@@ -3195,6 +3506,67 @@ def run_ablation_tests(
             except Exception:
                 feat_abl_logits.append({nt: torch.zeros(g[nt].x.shape[0]) for nt in xd if nt != "rca_context"})
     results["feature_ablation"] = _rca_acc_from_logits(feat_abl_logits, graphs)
+
+    # ---- E. Aggregated-stats MLP baseline (NO per-node topology) ------------
+    # Uses only mean/std/max/min per feature per node type (graph-level aggregates).
+    # This baseline cannot use topology at all — if GNN >> this baseline, topology matters.
+    class _AggMLPBaseline(nn.Module):
+        def __init__(self, node_dims: Dict[str, int]) -> None:
+            super().__init__()
+            self.heads = nn.ModuleDict({
+                f"h_{nt}": nn.Sequential(
+                    nn.Linear(node_dims[nt] * 4, 64), nn.ReLU(),
+                    nn.Linear(64, 1)
+                )
+                for nt in node_dims if nt != "rca_context"
+            })
+
+        def forward(self, x_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            out: Dict[str, torch.Tensor] = {}
+            for nt, x in x_dict.items():
+                key = f"h_{nt}"
+                if key not in self.heads:
+                    continue
+                # Aggregate: [1, F*4] → broadcast to [N, 1]
+                agg = torch.cat([x.mean(0), x.std(0), x.max(0).values, x.min(0).values], dim=0)
+                agg_expanded = agg.unsqueeze(0).expand(x.shape[0], -1)
+                out[nt] = self.heads[key](agg_expanded).squeeze(-1)
+            return out
+
+    agg_mlp = _AggMLPBaseline(node_dims)
+    agg_mlp.eval()
+    agg_logits = []
+    with torch.no_grad():
+        for g in graphs:
+            xd = {nt: g[nt].x.float() for nt in NODE_TYPES if nt != "rca_context"}
+            agg_logits.append(agg_mlp(xd))
+    results["agg_stats_mlp_baseline"] = _rca_acc_from_logits(agg_logits, graphs)
+
+    # ---- F. Temporal-shuffle ablation (scramble temporal channels) ----------
+    # If shuffling time destroys performance, temporal ordering is used.
+    model_f = _TinySanityModel(node_dims=node_dims)
+    model_f.eval()
+    temp_shuffle_logits = []
+    with torch.no_grad():
+        for g in graphs:
+            xd = {nt: g[nt].x.float().clone() for nt in NODE_TYPES}
+            for nt in xd:
+                x = xd[nt]
+                n, _ = x.shape
+                # Identify temporal channel columns: every group of 4 cols,
+                # channels 1-3 are delta_short, delta_long, rolling_var.
+                # Shuffle them independently per node.
+                perm = torch.randperm(n)
+                xd[nt][:, 1::4] = x[perm, 1::4]   # delta_short shuffled
+                xd[nt][:, 2::4] = x[perm, 2::4]   # delta_long shuffled
+                xd[nt][:, 3::4] = x[perm, 3::4]   # rolling_var shuffled
+            ei_d = {et: g[et].edge_index for et in all_edge_types if et in g.edge_types}
+            ea_d = {et: g[et].edge_attr.float() for et in all_edge_types if et in g.edge_types}
+            try:
+                temp_shuffle_logits.append(model_f(xd, ei_d, ea_d))
+            except Exception:
+                temp_shuffle_logits.append({nt: torch.zeros(g[nt].x.shape[0]) for nt in xd if nt != "rca_context"})
+    results["temporal_shuffle"] = _rca_acc_from_logits(temp_shuffle_logits, graphs)
 
     return results
 
