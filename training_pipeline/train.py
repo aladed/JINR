@@ -25,6 +25,11 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv, HeteroConv
 from torch_geometric.nn import Linear as PyGLinear
 
+from training_pipeline.diagnostics import (
+    CANDIDATE_TYPES, full_report, per_type_report, score_loader,
+    summary_line, typed_to_flat,
+)
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -69,10 +74,17 @@ DROPOUT      = 0.1
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
 EPOCHS       = 30
-BATCH_SIZE   = 4
+BATCH_SIZE   = 16
 PATIENCE     = 5
-TRAIN_RATIO  = 0.80
+TRAIN_RATIO  = 0.70
+VAL_RATIO    = 0.15
 SEED         = 42
+
+# Phase-2 recalibration (see artifacts/phase1_summary.md)
+POS_WEIGHT_CAP = 20.0   # F2: raw pos_weight up to 332 saturates logits
+
+# Phase-5 / E1: listwise root-cause objective — L = BCE + LISTWISE_WEIGHT * listwise
+LISTWISE_WEIGHT = 1.0
 
 EDGE_DIM_PHYSICAL = 19
 EDGE_DIM_DUMMY    = 1
@@ -114,22 +126,29 @@ def build_dataloaders(
     train_ratio: float = TRAIN_RATIO,
     batch_size: int = BATCH_SIZE,
     seed: int = SEED,
-) -> Tuple[DataLoader, DataLoader]:
-    """Split indices deterministically and return train/val DataLoaders."""
+    val_ratio: float = VAL_RATIO,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Deterministic 3-way split -> (train, val, test) DataLoaders.
+
+    The seed and permutation are unchanged from the original 80/20 split, so
+    the test slice perm[n_train+n_val:] is a strict subset of the original
+    validation region perm[800:]. A checkpoint trained on the old 80% split
+    has therefore never seen the new test set — no train/test leakage.
+    """
     rng = torch.Generator()
     rng.manual_seed(seed)
     perm = torch.randperm(num_total, generator=rng).tolist()
 
     n_train = int(num_total * train_ratio)
+    n_val   = int(num_total * val_ratio)
     train_idx = perm[:n_train]
-    val_idx   = perm[n_train:]
+    val_idx   = perm[n_train:n_train + n_val]
+    test_idx  = perm[n_train + n_val:]
 
-    train_ds = RCADataset(train_idx)
-    val_ds   = RCADataset(val_idx)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader
+    train_loader = DataLoader(RCADataset(train_idx), batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(RCADataset(val_idx),   batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(RCADataset(test_idx),  batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +303,8 @@ def compute_masked_loss(
     n_terms      = 0
 
     for nt, lg in logits.items():
+        if nt not in CANDIDATE_TYPES:
+            continue  # F3: cpu/gpu/job never root cause — skip trivial all-negative terms
         if not hasattr(batch[nt], "y") or batch[nt].y is None:
             continue
         y  = batch[nt].y.float().to(device)
@@ -314,137 +335,69 @@ def compute_masked_loss(
 
 
 # ---------------------------------------------------------------------------
-# Metrics
+# Listwise root-cause loss (Phase 5 / E1)
 # ---------------------------------------------------------------------------
 
-def compute_metrics(
-    all_logits: Dict[str, List[torch.Tensor]],
-    all_labels: Dict[str, List[torch.Tensor]],
-    all_masks:  Dict[str, List[torch.Tensor]],
-) -> Dict[str, float]:
-    """Compute precision, recall, F1, ROC-AUC per node type and global.
+def _listwise_graph_loss(
+    cand_logits: torch.Tensor, cand_labels: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Per-graph listwise loss: -log softmax(cand_logits)[true RC index].
 
-    Implemented without sklearn to avoid NumPy 2.x compatibility issues.
+    Returns None for graphs with no candidate nodes or no root cause
+    (healthy graphs) — they contribute nothing to the objective.
     """
-
-    def _roc_auc(labels: torch.Tensor, probs: torch.Tensor) -> float:
-        """Compute ROC-AUC via trapezoidal rule (pure torch)."""
-        n_pos = int(labels.sum().item())
-        n_neg = int((1 - labels).sum().item())
-        if n_pos == 0 or n_neg == 0:
-            return 0.5
-        # Sort by descending probability
-        order = torch.argsort(probs, descending=True)
-        labs_sorted = labels[order].float()
-        tps = labs_sorted.cumsum(0)
-        fps = (1 - labs_sorted).cumsum(0)
-        tpr = tps / n_pos
-        fpr = fps / n_neg
-        # Prepend (0,0)
-        tpr = torch.cat([torch.zeros(1), tpr])
-        fpr = torch.cat([torch.zeros(1), fpr])
-        auc = float(torch.trapz(tpr, fpr).item())
-        return max(0.0, min(1.0, auc))
-
-    def _prf(labels: torch.Tensor, preds: torch.Tensor) -> Tuple[float, float, float]:
-        tp = int(((preds == 1) & (labels == 1)).sum().item())
-        fp = int(((preds == 1) & (labels == 0)).sum().item())
-        fn = int(((preds == 0) & (labels == 1)).sum().item())
-        precision = tp / max(tp + fp, 1)
-        recall    = tp / max(tp + fn, 1)
-        f1        = 2 * precision * recall / max(precision + recall, 1e-8)
-        return precision, recall, f1
-
-    per_type: Dict[str, Dict[str, float]] = {}
-    global_preds:  List[int]   = []
-    global_labels: List[int]   = []
-    global_probs:  List[float] = []
-
-    for nt in all_logits:
-        if not all_logits[nt]:
-            continue
-        lg  = torch.cat(all_logits[nt], dim=0).cpu()
-        y   = torch.cat(all_labels[nt], dim=0).cpu().long()
-        msk = torch.cat(all_masks[nt],  dim=0).cpu()
-
-        lg_m = lg[msk]
-        y_m  = y[msk]
-
-        if len(y_m) == 0 or y_m.sum() == 0:
-            continue
-
-        probs = torch.sigmoid(lg_m)
-        preds = (probs >= 0.5).long()
-
-        p, r, f1 = _prf(y_m, preds)
-        auc      = _roc_auc(y_m.float(), probs)
-
-        per_type[nt] = {"precision": p, "recall": r, "f1": f1, "roc_auc": auc}
-
-        global_preds.extend(preds.tolist())
-        global_labels.extend(y_m.tolist())
-        global_probs.extend(probs.tolist())
-
-    if not global_labels or sum(global_labels) == 0:
-        global_metrics = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "roc_auc": 0.5}
-    else:
-        gl = torch.tensor(global_labels, dtype=torch.long)
-        gp = torch.tensor(global_preds,  dtype=torch.long)
-        gpr = torch.tensor(global_probs, dtype=torch.float32)
-        p, r, f1 = _prf(gl, gp)
-        auc = _roc_auc(gl.float(), gpr)
-        global_metrics = {"precision": p, "recall": r, "f1": f1, "roc_auc": auc}
-
-    return {"global": global_metrics, "per_type": per_type}
+    if cand_logits.numel() == 0 or int(cand_labels.sum()) == 0:
+        return None
+    rc_idx = int(torch.argmax(cand_labels))
+    logp = torch.log_softmax(cand_logits, dim=0)
+    return -logp[rc_idx]
 
 
-def compute_rca_accuracy(
-    logits_list: List[Dict[str, torch.Tensor]],
-    graphs_list: List[HeteroData],
-) -> float:
-    """Top-1 Root Cause Accuracy.
+def compute_listwise_loss(
+    logits: Dict[str, torch.Tensor],
+    batch: HeteroData,
+    device: torch.device,
+) -> torch.Tensor:
+    """E1: mean per-graph listwise root-cause loss.
 
-    For each faulted graph: find the node with the highest logit across
-    all node types, check if it matches the true root cause (y==1).
-    Healthy graphs (no positive label) are excluded.
+    For each faulted graph, softmax over the concatenated candidate-node
+    logits {hdd,switch,ram} and penalise -log p(true RC). Reuses the BCE
+    head logits — no extra parameters. Healthy and malformed (no-candidate)
+    graphs are skipped; safe against empty softmax and NaN.
     """
-    correct = 0
-    total   = 0
+    n_graphs = int(getattr(batch, "num_graphs", 1))
+    per_logits: List[List[torch.Tensor]] = [[] for _ in range(n_graphs)]
+    per_labels: List[List[torch.Tensor]] = [[] for _ in range(n_graphs)]
 
-    for logits, g in zip(logits_list, graphs_list):
-        # Collect all (logit, node_type, local_idx) for this graph
-        best_score: float = -1e9
-        best_nt:    str   = ""
-        best_idx:   int   = -1
-
-        for nt, lg in logits.items():
-            if not hasattr(g[nt], "y"):
-                continue
-            scores = torch.sigmoid(lg.cpu())
-            top_val, top_idx = scores.max(dim=0)
-            if top_val.item() > best_score:
-                best_score = top_val.item()
-                best_nt    = nt
-                best_idx   = int(top_idx.item())
-
-        if best_nt == "":
+    for nt in CANDIDATE_TYPES:
+        if nt not in logits or nt not in batch.node_types:
             continue
+        node = batch[nt]
+        if not hasattr(node, "y") or node.y is None:
+            continue
+        y = node.y
+        gvec = getattr(node, "batch", None)
+        if gvec is None:
+            gvec = torch.zeros(y.size(0), dtype=torch.long, device=y.device)
+        for g in range(n_graphs):
+            m = (gvec == g)
+            if bool(m.any()):
+                per_logits[g].append(logits[nt][m])
+                per_labels[g].append(y[m])
 
-        # Check if this graph has a positive label at all
-        has_pos = any(
-            int(g[nt].y.sum().item()) > 0
-            for nt in logits
-            if hasattr(g[nt], "y")
+    losses: List[torch.Tensor] = []
+    for g in range(n_graphs):
+        if not per_logits[g]:
+            continue
+        gl = _listwise_graph_loss(
+            torch.cat(per_logits[g]), torch.cat(per_labels[g])
         )
-        if not has_pos:
-            continue  # healthy graph — skip
+        if gl is not None:
+            losses.append(gl)
 
-        total += 1
-        true_label = int(g[best_nt].y[best_idx].item())
-        if true_label == 1:
-            correct += 1
-
-    return correct / max(total, 1)
+    if not losses:
+        return torch.zeros((), device=device, requires_grad=True)
+    return torch.stack(losses).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -487,11 +440,19 @@ def train_one_epoch(
     device: torch.device,
     edge_types: List[Tuple[str, str, str]],
     grad_clip: float = 1.0,
-) -> float:
-    """Run one training epoch. Returns mean train loss."""
+) -> Tuple[float, Dict[str, float]]:
+    """Run one training epoch. Returns (mean_loss, grad_norm_stats).
+
+    grad_norm_stats records the mean/std gradient norm of each candidate
+    classifier head — evidence for whether the batch-size / pos_weight
+    recalibration reduced gradient variance (F4).
+    """
     model.train()
     total_loss = 0.0
+    total_bce  = 0.0
+    total_lw   = 0.0
     n_batches  = 0
+    grad_norms: Dict[str, List[float]] = {nt: [] for nt in CANDIDATE_TYPES}
 
     for batch in loader:
         batch = _batch_to_device(batch, device)
@@ -499,21 +460,37 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         logits = model(x_dict, ei_dict, ea_dict)
-
-        loss = compute_masked_loss(logits, batch, pos_weights, device)
+        loss_bce = compute_masked_loss(logits, batch, pos_weights, device)
+        loss_lw  = compute_listwise_loss(logits, batch, device)
+        loss = loss_bce + LISTWISE_WEIGHT * loss_lw
 
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  [WARN] NaN/Inf loss detected — skipping batch")
+            print("  [WARN] NaN/Inf loss detected — skipping batch")
             continue
 
         loss.backward()
+        for nt in CANDIDATE_TYPES:
+            w = model.classifiers[f"cls_{nt}"].weight
+            if w.grad is not None:
+                grad_norms[nt].append(float(w.grad.norm()))
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         total_loss += loss.item()
+        total_bce  += loss_bce.item()
+        total_lw   += loss_lw.item()
         n_batches  += 1
 
-    return total_loss / max(n_batches, 1)
+    stats: Dict[str, float] = {}
+    for nt, norms in grad_norms.items():
+        if norms:
+            t = torch.tensor(norms)
+            stats[f"{nt}_mean"] = round(float(t.mean()), 5)
+            stats[f"{nt}_std"]  = round(float(t.std(unbiased=False)), 5)
+    n = max(n_batches, 1)
+    stats["bce_mean"]      = round(total_bce / n, 5)
+    stats["listwise_mean"] = round(total_lw / n, 5)
+    return total_loss / n, stats
 
 
 def validate(
@@ -522,53 +499,31 @@ def validate(
     pos_weights: Dict[str, torch.Tensor],
     device: torch.device,
     edge_types: List[Tuple[str, str, str]],
-) -> Tuple[float, Dict[str, float], float]:
-    """Run validation. Returns (val_loss, metrics_dict, rca_accuracy)."""
-    model.eval()
+) -> Tuple[float, Dict[str, object]]:
+    """Run validation. Returns (val_loss, diagnostics report).
 
+    The report is diagnostics.full_report() over the candidate node set —
+    per-graph, candidate-restricted, threshold-swept — plus a per_type
+    breakdown. Replaces the broken per-batch compute_rca_accuracy path (F1).
+    """
+    model.eval()
     total_loss = 0.0
     n_batches  = 0
-
-    all_logits: Dict[str, List[torch.Tensor]] = {}
-    all_labels: Dict[str, List[torch.Tensor]] = {}
-    all_masks:  Dict[str, List[torch.Tensor]] = {}
-
-    # For RCA accuracy we need per-graph logits
-    per_graph_logits: List[Dict[str, torch.Tensor]] = []
-    per_graph_data:   List[HeteroData]               = []
 
     with torch.no_grad():
         for batch in loader:
             batch = _batch_to_device(batch, device)
             x_dict, ei_dict, ea_dict = _prepare_inputs(batch, edge_types, device)
-
             logits = model(x_dict, ei_dict, ea_dict)
-            loss   = compute_masked_loss(logits, batch, pos_weights, device)
-
+            loss = compute_masked_loss(logits, batch, pos_weights, device)
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 total_loss += loss.item()
                 n_batches  += 1
 
-            for nt, lg in logits.items():
-                if nt not in all_logits:
-                    all_logits[nt] = []
-                    all_labels[nt] = []
-                    all_masks[nt]  = []
-                all_logits[nt].append(lg.cpu())
-                if hasattr(batch[nt], "y"):
-                    all_labels[nt].append(batch[nt].y.cpu())
-                if hasattr(batch[nt], "loss_mask"):
-                    all_masks[nt].append(batch[nt].loss_mask.cpu())
-
-            # Unbatch for RCA accuracy (approximate: treat batch as one graph)
-            per_graph_logits.append({nt: lg.cpu() for nt, lg in logits.items()})
-            per_graph_data.append(batch.cpu())
-
-    val_loss = total_loss / max(n_batches, 1)
-    metrics  = compute_metrics(all_logits, all_labels, all_masks)
-    rca_acc  = compute_rca_accuracy(per_graph_logits, per_graph_data)
-
-    return val_loss, metrics, rca_acc
+    typed = score_loader(model, loader, edge_types, device)
+    report = full_report(typed_to_flat(typed))
+    report["per_type"] = per_type_report(typed)
+    return total_loss / max(n_batches, 1), report
 
 
 def evaluate_model(
@@ -577,33 +532,28 @@ def evaluate_model(
     pos_weights: Dict[str, torch.Tensor],
     device: torch.device,
     edge_types: List[Tuple[str, str, str]],
-) -> None:
-    """Load best checkpoint and print final evaluation metrics."""
+    split_name: str = "val",
+) -> Dict[str, object]:
+    """Load the best checkpoint and print final diagnostics on `loader`."""
     if os.path.exists(BEST_MODEL_PATH):
         state = torch.load(BEST_MODEL_PATH, map_location=device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         print(f"Loaded best checkpoint from epoch {state.get('epoch', '?')}")
 
-    val_loss, metrics, rca_acc = validate(model, loader, pos_weights, device, edge_types)
+    loss, report = validate(model, loader, pos_weights, device, edge_types)
 
     print("\n" + "=" * 60)
-    print("FINAL EVALUATION")
+    print(f"FINAL EVALUATION  ({split_name} split)")
     print("=" * 60)
-    print(f"  val_loss  : {val_loss:.4f}")
-    g = metrics["global"]
-    print(f"  precision : {g['precision']:.4f}")
-    print(f"  recall    : {g['recall']:.4f}")
-    print(f"  F1        : {g['f1']:.4f}")
-    print(f"  ROC-AUC   : {g['roc_auc']:.4f}")
-    print(f"  RCA Top-1 : {rca_acc:.4f}")
-    print()
-    print("Per-node-type metrics:")
-    for nt, m in metrics.get("per_type", {}).items():
-        print(
-            f"  {nt:<14}  "
-            f"P={m['precision']:.3f}  R={m['recall']:.3f}  "
-            f"F1={m['f1']:.3f}  AUC={m['roc_auc']:.3f}"
-        )
+    print(f"  loss : {loss:.4f}")
+    print(f"  {summary_line(report)}")
+    print(f"  rank histogram : {report['rca']['rank_histogram']}")
+    for nt, m in report.get("per_type", {}).items():
+        rt = m["rca"]["top1"]
+        rt_s = "N/A" if rt is None else f"{rt:.3f}"
+        print(f"  {nt:<8} AUC={m['roc_auc']:.3f}  "
+              f"F1@best={m['f1_at_best_threshold']:.3f}  RCA-Top1={rt_s}")
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -649,15 +599,17 @@ def main() -> None:
     num_total: int = metadata["dataset_size"]
 
     pos_weights: Dict[str, torch.Tensor] = {
-        nt: torch.tensor([pw], dtype=torch.float32)
+        nt: torch.tensor([min(pw, POS_WEIGHT_CAP)], dtype=torch.float32)
         for nt, pw in loss_cfg["pos_weight"].items()
     }
+    print(f"pos_weight capped at {POS_WEIGHT_CAP} "
+          f"(raw max was {max(loss_cfg['pos_weight'].values()):.1f})")
 
     print(f"Dataset: {num_total} graphs  |  node types: {list(node_dims.keys())}")
     print(f"Edge types: {len(edge_types)}")
 
     # ---- DataLoaders -------------------------------------------------------
-    train_loader, val_loader = build_dataloaders(
+    train_loader, val_loader, test_loader = build_dataloaders(
         num_total=num_total,
         train_ratio=TRAIN_RATIO,
         batch_size=BATCH_SIZE,
@@ -665,7 +617,8 @@ def main() -> None:
     )
     print(
         f"Train: {len(train_loader.dataset)} graphs  |  "
-        f"Val: {len(val_loader.dataset)} graphs"
+        f"Val: {len(val_loader.dataset)} graphs  |  "
+        f"Test: {len(test_loader.dataset)} graphs (held out)"
     )
 
     # ---- Model -------------------------------------------------------------
@@ -689,6 +642,7 @@ def main() -> None:
     history: Dict[str, List] = {
         "train_loss": [], "val_loss": [],
         "val_f1": [], "val_roc_auc": [], "rca_accuracy": [],
+        "val_mrr": [], "grad_norms": [],
     }
 
     best_val_f1    = -1.0
@@ -696,41 +650,46 @@ def main() -> None:
     best_epoch     = 0
 
     print()
-    print("=" * 70)
-    print(f"{'Epoch':>5}  {'train_loss':>10}  {'val_loss':>9}  "
-          f"{'val_f1':>7}  {'rca_acc':>8}  {'time':>6}")
-    print("=" * 70)
+    print("=" * 78)
+    print("Training — early-stop signal: best-threshold F1 on val candidate set")
+    print("=" * 78)
 
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
 
-        train_loss = train_one_epoch(
+        train_loss, grad_stats = train_one_epoch(
             model, train_loader, optimizer, pos_weights, device, edge_types
         )
-        val_loss, metrics, rca_acc = validate(
+        val_loss, report = validate(
             model, val_loader, pos_weights, device, edge_types
         )
 
-        val_f1   = metrics["global"]["f1"]
-        val_auc  = metrics["global"]["roc_auc"]
-        elapsed  = time.time() - t0
+        val_f1  = float(report["f1_at_best_threshold"])
+        val_auc = float(report["roc_auc"])
+        _rca    = report["rca"]["top1"]
+        _mrr    = report["rca"]["mrr"]
+        rca_acc = float(_rca) if _rca is not None else 0.0
+        mrr_val = float(_mrr) if _mrr is not None else 0.0
+        elapsed = time.time() - t0
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_f1"].append(val_f1)
         history["val_roc_auc"].append(val_auc)
         history["rca_accuracy"].append(rca_acc)
+        history["val_mrr"].append(mrr_val)
+        history["grad_norms"].append(grad_stats)
 
         print(
-            f"Epoch {epoch:02d} | "
-            f"train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | "
-            f"val_f1={val_f1:.4f} | "
-            f"rca_acc={rca_acc:.4f} | "
+            f"Epoch {epoch:02d} | loss={train_loss:.4f} "
+            f"(bce={grad_stats.get('bce_mean', 0):.3f} "
+            f"lw={grad_stats.get('listwise_mean', 0):.3f}) | "
+            f"val_loss={val_loss:.4f} | AUC={val_auc:.4f} | "
+            f"F1@best={val_f1:.4f} | RCA={rca_acc:.4f} | MRR={mrr_val:.4f} | "
             f"{elapsed:.1f}s"
         )
 
-        # ---- Checkpoint best model ----------------------------------------
+        # ---- Checkpoint on best-threshold F1 (F5: val_f1@0.5 was corrupted) ----
         if val_f1 > best_val_f1:
             best_val_f1    = val_f1
             best_epoch     = epoch
@@ -782,7 +741,8 @@ def main() -> None:
     print(f"Best model: epoch {best_epoch}  val_f1={best_val_f1:.4f}")
 
     # ---- Final evaluation on best checkpoint ------------------------------
-    evaluate_model(model, val_loader, pos_weights, device, edge_types)
+    evaluate_model(model, val_loader,  pos_weights, device, edge_types, "val")
+    evaluate_model(model, test_loader, pos_weights, device, edge_types, "test")
 
     # ---- Log experiment to registry ----------------------------------------
     if _VERSIONING_AVAILABLE and _exp_id is not None:
@@ -810,12 +770,14 @@ def main() -> None:
                 loss_config=loss_cfg.get("pos_weight", {}),
                 optimizer_config={"optimizer": "AdamW", "lr": LR, "weight_decay": WEIGHT_DECAY},
                 training_config={
-                    "epochs":      EPOCHS,
-                    "batch_size":  BATCH_SIZE,
-                    "patience":    PATIENCE,
-                    "train_ratio": TRAIN_RATIO,
-                    "seed":        SEED,
-                    "device":      str(device),
+                    "epochs":          EPOCHS,
+                    "batch_size":      BATCH_SIZE,
+                    "patience":        PATIENCE,
+                    "train_ratio":     TRAIN_RATIO,
+                    "seed":            SEED,
+                    "device":          str(device),
+                    "pos_weight_cap":  POS_WEIGHT_CAP,
+                    "listwise_weight": LISTWISE_WEIGHT,
                 },
                 metrics={
                     "best_val_f1":          best_val_f1,

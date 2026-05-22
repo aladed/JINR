@@ -814,10 +814,18 @@ def _resolve_fault_plan(
             ("ram", rc_host, pf_idx,   amp * 0.80,     +1.0, rc_act),
         ]
 
-        # Cross-type: ram leak occasionally shows mild cpu_iowait signature
-        if rng.random() < 0.20:
-            iowait_idx = _feat_idx("cpu", "cpu_iowait_percent")
-            all_anomalies.append(("cpu", rc_host, iowait_idx, amp * 0.12, +1.0, rc_act))
+        # Downstream CPU: memory pressure -> kernel reclaim / swap overhead.
+        # Phase-4 fix: structural corroboration for the RC ram node, matching
+        # hdd_degradation (see artifacts/phase5_ram_diagnostic.md).
+        sys_idx = _feat_idx("cpu", "cpu_system_percent")
+        victim_cpus_rl: List[int] = []
+        if rng.random() < 0.70:
+            victim_cpus_rl.append(rc_host)
+            atten   = float(rng.uniform(0.15, 0.9))
+            noise_v = float(rng.normal(0.0, 0.05))
+            act_cpu = activation_step_for("cpu", rc_host)
+            all_anomalies.append(("cpu", rc_host, sys_idx,
+                                  amp * 0.6 * atten + noise_v, +1.0, act_cpu))
 
         ram_idx     = _feat_idx("job", "job_ram_usage_percent")
         wait_idx    = _feat_idx("job", "job_wait_time_seconds")
@@ -835,7 +843,7 @@ def _resolve_fault_plan(
                     ("job", jid, runtime_idx, v_amp * 0.35, +1.0, act_job),
                 ]
 
-        victim_node_ids = {"job": victim_jobs_rl}
+        victim_node_ids = {"cpu": victim_cpus_rl, "job": victim_jobs_rl}
 
     # --- Labels ---
     y_dict: Dict[str, torch.Tensor] = {}
@@ -1499,6 +1507,17 @@ def _inject_ram_leak(
     ram_t = _apply_anomaly(ram_t, [rc_host], pf_idx,   amp * 0.80,       +1.0)
     state["ram"] = ram_t
 
+    # Downstream CPU: memory pressure -> kernel reclaim / swap overhead.
+    # Phase-4 fix: ram_leak now structurally corroborates the RC node, like
+    # hdd_degradation and network_congestion (see phase5_ram_diagnostic.md).
+    cpu_t = state["cpu"]
+    sys_idx = _feat_idx("cpu", "cpu_system_percent")
+    cpu_t = _apply_anomaly_stochastic(
+        cpu_t, [rc_host], sys_idx, amp * 0.6, +1.0, rng,
+        propagation_prob=0.70, attenuation_range=(0.15, 0.9), noise_scale=0.05,
+    )
+    state["cpu"] = cpu_t
+
     # Downstream Jobs: stochastic, some may look worse
     victim_jobs: List[int] = []
     job_t = state["job"]
@@ -1517,7 +1536,7 @@ def _inject_ram_leak(
     state = _break_argmax_shortcut(state, "ram", rc_host, rng, n_decoys=4, decoy_scale=0.10)
     state = _add_healthy_outliers(state, rng, spike_prob=0.06, spike_scale=0.08)
 
-    victim_node_ids: Dict[str, List[int]] = {"job": victim_jobs}
+    victim_node_ids: Dict[str, List[int]] = {"cpu": [rc_host], "job": victim_jobs}
 
     y_dict: Dict[str, torch.Tensor] = {}
     loss_mask_dict: Dict[str, torch.Tensor] = {}
@@ -2347,7 +2366,7 @@ def _write_generation_manifest(
             "fault_types":      FAULT_TYPES,
             "severity_min":     0.15,
             "severity_max":     0.45,
-            "propagation_algo": "phase2_bfs_temporal_activation",
+            "propagation_algo": "phase4_ram_cpu_propagation",
         },
         "seeds": {
             "master_seed": base_seed,
@@ -2380,24 +2399,25 @@ def _write_generation_manifest(
 
     write_dataset_manifest(
         manifest_dir=manifest_dir,
-        dataset_version="v2.0.0",
+        dataset_version="v2.1.0",
         dataset_hash=dataset_hash,
-        codename="phase2_causal_propagation",
+        codename="phase4_ram_cpu_propagation",
         semantic_config=semantic_config,
         feature_schema={k: list(v) for k, v in FEATURE_SCHEMA.items()},
         total_graphs=num_samples,
         healthy_graphs=healthy_count,
         node_dims=node_dims,
         edge_types=all_edge_types,
-        previous_version="v1.0.0",
+        previous_version="v2.0.0",
         changelog=(
-            "Phase-2 hardening: BFS temporal propagation, rolling variance channel, "
-            "cross-type signatures, healthy transient spikes"
+            "Phase-4 data fix: ram_leak now propagates to the host CPU "
+            "(cpu_system_percent), matching hdd_degradation and "
+            "network_congestion. Removes the structural asymmetry where ram "
+            "root causes had no anomalous neighbour. Feature schema unchanged."
         ),
         breaking_changes=[
-            "Temporal tensor expanded from [N,F,3] to [N,F,4] (added rolling_var)",
-            "Feature dimensionality per node increased (~33%)",
-            "Checkpoints from v1.x incompatible with v2.x",
+            "Fault distribution changed (ram_leak propagation) - metrics are "
+            "not directly comparable to v2.0.0; retraining required.",
         ],
     )
 

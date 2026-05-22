@@ -1,0 +1,13 @@
+{
+  "manifest_schema_version": "v2.0",
+  "version_lineage": {
+    "breaking_changes": [
+      "Temporal tensor expanded from [N,F,3] to [N,F,4] (added rolling_var)",
+      "Feature dimensionality per node increased (~33%)",
+      "Checkpoints from v1.x incompatible with v2.x"
+    ],
+    "changelog": "Phase-2 hardening: BFS temporal propagation, rolling variance channel, cross-type signatures, healthy transient spikes",
+    "current_version": "v2.0.0",
+    "previous_version": "v1.0.0"
+  }
+}

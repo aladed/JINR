@@ -253,8 +253,8 @@ def mode_fast(exp: Dict, imports: Dict) -> bool:
             for nt, pw in loss_cfg.get("pos_weight", {}).items()
         }
 
-        _, val_loader = build_dataloaders(
-            num_total=num_total, train_ratio=0.80, batch_size=4, seed=42
+        _, val_loader, _ = build_dataloaders(
+            num_total=num_total, batch_size=4, seed=42
         )
 
         state = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -267,7 +267,7 @@ def mode_fast(exp: Dict, imports: Dict) -> bool:
         ).to(device)
         model.load_state_dict(state["model_state_dict"])
 
-        val_loss, metrics, rca_acc = validate(model, val_loader, pos_weights, device, edge_types)
+        val_loss, report = validate(model, val_loader, pos_weights, device, edge_types)
 
         orig = exp.get("metrics", {})
         tolerances = imports["METRIC_TOLERANCES"]
@@ -276,11 +276,10 @@ def mode_fast(exp: Dict, imports: Dict) -> bool:
         print(f"  {'Metric':<22}  {'Original':>10}  {'Now':>10}  {'Δ':>8}  Status")
         print("  " + "─" * 62)
 
-        g = metrics.get("global", {})
         comparisons = [
-            ("val_f1",         orig.get("best_val_f1"),       g.get("f1"),      tolerances["f1"]),
-            ("val_roc_auc",    orig.get("final_val_roc_auc"), g.get("roc_auc"), tolerances["roc_auc"]),
-            ("rca_accuracy",   orig.get("final_rca_accuracy"), rca_acc,          tolerances["rca_accuracy"]),
+            ("val_f1",       orig.get("best_val_f1"),        report["f1_at_best_threshold"], tolerances["f1"]),
+            ("val_roc_auc",  orig.get("final_val_roc_auc"),  report["roc_auc"],              tolerances["roc_auc"]),
+            ("rca_accuracy", orig.get("final_rca_accuracy"), report["rca"]["top1"],          tolerances["rca_accuracy"]),
         ]
         all_within = True
         for name, orig_val, new_val, tol in comparisons:

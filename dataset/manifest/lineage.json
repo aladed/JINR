@@ -2,12 +2,10 @@
   "manifest_schema_version": "v2.0",
   "version_lineage": {
     "breaking_changes": [
-      "Temporal tensor expanded from [N,F,3] to [N,F,4] (added rolling_var)",
-      "Feature dimensionality per node increased (~33%)",
-      "Checkpoints from v1.x incompatible with v2.x"
+      "Fault distribution changed (ram_leak propagation) - metrics are not directly comparable to v2.0.0; retraining required."
     ],
-    "changelog": "Phase-2 hardening: BFS temporal propagation, rolling variance channel, cross-type signatures, healthy transient spikes",
-    "current_version": "v2.0.0",
-    "previous_version": "v1.0.0"
+    "changelog": "Phase-4 data fix: ram_leak now propagates to the host CPU (cpu_system_percent), matching hdd_degradation and network_congestion. Removes the structural asymmetry where ram root causes had no anomalous neighbour. Feature schema unchanged.",
+    "current_version": "v2.1.0",
+    "previous_version": "v2.0.0"
   }
 }
