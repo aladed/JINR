@@ -11,7 +11,14 @@
       "PowerShell(python -c \"import ast; ast.parse\\(open\\('d:/Vlad/JINR/training_pipeline/dataset_generator.py'\\).read\\(\\)\\); print\\('AST OK'\\)\")",
       "Bash(python -m py_compile d:\\\\Vlad\\\\JINR\\\\training_pipeline\\\\dataset_generator.py)",
       "PowerShell(python -m py_compile \"d:\\\\Vlad\\\\JINR\\\\training_pipeline\\\\dataset_generator.py\" -v)",
-      "PowerShell(python -m py_compile \"d:\\\\Vlad\\\\JINR\\\\training_pipeline\\\\dataset_generator.py\")"
+      "PowerShell(python -m py_compile \"d:\\\\Vlad\\\\JINR\\\\training_pipeline\\\\dataset_generator.py\")",
+      "Bash(git checkout *)",
+      "Bash(python -c \"import torch; print\\('torch', torch.__version__, 'cuda', torch.cuda.is_available\\(\\)\\)\")",
+      "Bash(/c/Users/Vlad/anaconda3/python.exe --version)",
+      "Bash(/c/Users/Vlad/anaconda3/python.exe -c 'import torch; print\\('\\\\''torch'\\\\'', torch.__version__, '\\\\''cuda_available'\\\\'', torch.cuda.is_available\\(\\)\\)')",
+      "Bash(/c/Users/Vlad/anaconda3/python.exe -c 'import torch_geometric; print\\('\\\\''pyg'\\\\'', torch_geometric.__version__\\)')",
+      "Bash(/c/Users/Vlad/anaconda3/python.exe -c 'import numpy; print\\('\\\\''numpy'\\\\'', numpy.__version__\\)')",
+      "Bash(/c/Users/Vlad/anaconda3/python.exe -W ignore -c ' *)"
     ]
   }
 }
