@@ -1,1 +1,117 @@
+version: '3.9'
 
+services:
+  # =========================================================================
+  # Layer 1: Knowledge Base (Qdrant Vector DB)
+  # =========================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: jinr_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT_API_KEY=qdrant_secret_key
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jinr_network
+    restart: unless-stopped
+
+  # =========================================================================
+  # Layer 1: Context Cache (Redis)
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: jinr_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_storage:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jinr_network
+    restart: unless-stopped
+
+  # =========================================================================
+  # Layer 2: LLM Inference (Ollama with Mistral 7B)
+  # =========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: jinr_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - jinr_network
+    restart: unless-stopped
+
+  # =========================================================================
+  # Main Application (Python)
+  # =========================================================================
+  jinr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jinr_app
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      # Layer 1: Knowledge
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_API_KEY: qdrant_secret_key
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Layer 2: LLM
+      OLLAMA_HOST: http://ollama:11434
+      LLM_MODEL: mistral
+      # Logging
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./checkpoints:/app/checkpoints
+      - ./dataset:/app/dataset
+    working_dir: /app
+    command: python -m remediation.run
+    networks:
+      - jinr_network
+    restart: unless-stopped
+
+networks:
+  jinr_network:
+    driver: bridge
+
+volumes:
+  qdrant_storage:
+    driver: local
+  redis_storage:
+    driver: local
+  ollama_models:
+    driver: local
