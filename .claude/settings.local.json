@@ -18,7 +18,8 @@
       "Bash(/c/Users/Vlad/anaconda3/python.exe -c 'import torch; print\\('\\\\''torch'\\\\'', torch.__version__, '\\\\''cuda_available'\\\\'', torch.cuda.is_available\\(\\)\\)')",
       "Bash(/c/Users/Vlad/anaconda3/python.exe -c 'import torch_geometric; print\\('\\\\''pyg'\\\\'', torch_geometric.__version__\\)')",
       "Bash(/c/Users/Vlad/anaconda3/python.exe -c 'import numpy; print\\('\\\\''numpy'\\\\'', numpy.__version__\\)')",
-      "Bash(/c/Users/Vlad/anaconda3/python.exe -W ignore -c ' *)"
+      "Bash(/c/Users/Vlad/anaconda3/python.exe -W ignore -c ' *)",
+      "PowerShell($base = \"d:\\\\JINR\\\\edge-agent\"; $dirs = @\\(\"cmd\\\\agent\",\"internal\\\\config\",\"internal\\\\model\",\"internal\\\\collector\",\"internal\\\\pipeline\",\"deploy\"\\); foreach \\($d in $dirs\\) { New-Item -ItemType Directory -Force -Path \"$base\\\\$d\" | Out-Null }; \"Directories created\")"
     ]
   }
 }
