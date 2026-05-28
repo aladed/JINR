@@ -74,109 +74,126 @@ def health():
 @app.get("/topology")
 def topology() -> dict[str, Any]:
     """
-    Returns Grafana Node Graph format:
-      { "nodes": [...], "edges": [...] }
+    Returns Grafana Node Graph format: { "nodes": [...], "edges": [...] }
 
-    Node fields expected by the Node Graph panel when using Infinity:
-      id, title, subTitle, mainStat, secondaryStat, arc__fault, arc__ok,
-      color (one of: green / orange / red)
-
-    Edge fields:
-      id, source, target, mainStat
+    Node IDs use "{type}-{model_index}" to match inference_sample.json exactly.
+    Switches: model indices 0-3 = leaf, 4-5 = spine (NUM_LEAF=4, NUM_SPINE=2).
+    Edges built from the same static routing as snapshot_engine/topology.py:
+      host_to_leaf[h] = h % NUM_LEAF  (build_routing_maps seed=None, round-robin)
+      every leaf → both spines (uplinks)
     """
-    topo      = _load_json(TOPOLOGY_FILE)
-    inference = _load_json(INFERENCE_FILE) if INFERENCE_FILE.exists() else {}
+    topo_manifest = _load_json(TOPOLOGY_FILE)
+    inference     = _load_json(INFERENCE_FILE) if INFERENCE_FILE.exists() else {}
 
-    rc_node      = inference.get("rc_node", {})
-    rc_type      = rc_node.get("type", "")
-    rc_id        = rc_node.get("id", "")
-    confidence   = float(inference.get("confidence", 0.0))
-    fault_type   = inference.get("fault_type", "unknown")
-    top5: list   = inference.get("top5_candidates", [])
-    victims: list = inference.get("victim_nodes", [])
+    rc_node    = inference.get("rc_node", {})
+    rc_type    = rc_node.get("type", "")
+    rc_id_num  = rc_node.get("id", -1)          # integer model index
+    rc_node_id = f"{rc_type}-{rc_id_num}"        # canonical string: "hdd-82"
+    confidence = float(inference.get("confidence", 0.0))
+    fault_type = inference.get("fault_type", "unknown")
+    top5: list = inference.get("top5_candidates", [])
 
-    victim_ids  = {v.get("id", "") for v in victims}
-    top5_ids    = {c.get("id", "") for c in top5}
-    top5_scores = {c.get("id", ""): c.get("score", 0.0) for c in top5}
+    # top5_scores: {"hdd-82": 0.9999, "switch-2": 0.03, ...}
+    top5_scores: dict[str, float] = {c.get("id", ""): float(c.get("score", 0.0)) for c in top5}
 
-    topo_cfg = topo.get("topology_config", {})
-    n_hosts  = topo_cfg.get("NUM_HOSTS", 100)
-    n_leaf   = topo_cfg.get("NUM_LEAF", 4)
-    n_spine  = topo_cfg.get("NUM_SPINE", 2)
+    topo_cfg = topo_manifest.get("topology_config", {})
+    n_leaf   = int(topo_cfg.get("NUM_LEAF",  4))
+    n_spine  = int(topo_cfg.get("NUM_SPINE", 2))
+    n_sw     = n_leaf + n_spine        # leaf indices: 0..n_leaf-1, spine: n_leaf..n_sw-1
 
-    # Build a representative set of nodes (not all 100 hosts — too many for viz)
+    # Static routing: identical to build_routing_maps(seed=None) in dataset_generator
+    # host_to_leaf[h] = h % n_leaf
+    def host_leaf(h: int) -> int:
+        return h % n_leaf
+
     nodes: list[dict] = []
     edges: list[dict] = []
+    seen_node_ids: set[str] = set()
 
-    # Spine switches
-    for i in range(n_spine):
-        nid = f"SPINE-{i+1}"
-        score = top5_scores.get(nid, 0.0)
-        is_rc = (nid == rc_id)
+    def _add_node(nid: str, title: str, subtitle: str, score: float, is_rc: bool) -> None:
+        if nid in seen_node_ids:
+            return
+        seen_node_ids.add(nid)
+        fault_arc = confidence if is_rc else score
         nodes.append({
             "id":            nid,
-            "title":         nid,
-            "subTitle":      "spine switch",
-            "mainStat":      f"{score:.2f}" if score else ("RC" if is_rc else "ok"),
-            "secondaryStat": fault_type if is_rc else "",
-            "arc__fault":    confidence if is_rc else (score if score else 0),
-            "arc__ok":       1 - (confidence if is_rc else score),
-            "color":         _score_color(confidence if is_rc else score),
-        })
-
-    # Leaf switches
-    for i in range(n_leaf):
-        nid = f"SWITCH-{i+1}"
-        score = top5_scores.get(nid, 0.0)
-        is_rc = (nid == rc_id)
-        nodes.append({
-            "id":            nid,
-            "title":         nid,
-            "subTitle":      "leaf switch",
-            "mainStat":      f"{score:.2f}" if score else ("RC" if is_rc else "ok"),
-            "secondaryStat": fault_type if is_rc else "",
-            "arc__fault":    confidence if is_rc else score,
-            "arc__ok":       1 - (confidence if is_rc else score),
-            "color":         _score_color(confidence if is_rc else score),
-        })
-
-    # Sample of hosts (show victims + a few normal ones)
-    shown_hosts: set[str] = set()
-    for v in victims:
-        shown_hosts.add(v.get("id", ""))
-    for c in top5:
-        shown_hosts.add(c.get("id", ""))
-    # Add a few normal hosts for context
-    for i in range(1, min(n_hosts + 1, 8)):
-        shown_hosts.add(f"HOST-{i}")
-
-    for hid in sorted(shown_hosts):
-        score    = top5_scores.get(hid, 0.0)
-        is_rc    = (hid == rc_id)
-        is_vic   = hid in victim_ids
-        subtitle = "victim" if is_vic else ("RC" if is_rc else "host")
-        nodes.append({
-            "id":            hid,
-            "title":         hid,
+            "title":         title,
             "subTitle":      subtitle,
-            "mainStat":      f"{score:.2f}" if score else subtitle,
+            "mainStat":      "RC" if is_rc else (f"{score:.3f}" if score > 0.001 else "ok"),
             "secondaryStat": fault_type if is_rc else "",
-            "arc__fault":    confidence if is_rc else (score if score else (0.3 if is_vic else 0)),
-            "arc__ok":       1 - (confidence if is_rc else (score if score else (0.3 if is_vic else 0))),
-            "color":         "red" if is_rc else ("orange" if is_vic else "green"),
+            "arc__fault":    round(fault_arc, 4),
+            "arc__ok":       round(max(0.0, 1.0 - fault_arc), 4),
+            "color":         "red" if is_rc else _score_color(score),
         })
 
-    # Edges: leaf → spine uplinks
-    for i in range(n_leaf):
-        for j in range(n_spine):
-            eid = f"e_sw{i+1}_sp{j+1}"
-            edges.append({"id": eid, "source": f"SWITCH-{i+1}", "target": f"SPINE-{j+1}", "mainStat": "uplink"})
+    # ── 1. All switches (leaf + spine) — always shown ─────────────────────────
+    for sw_i in range(n_sw):
+        nid      = f"switch-{sw_i}"
+        is_rc    = (rc_type == "switch" and rc_id_num == sw_i)
+        score    = top5_scores.get(nid, 0.0)
+        role     = "leaf switch" if sw_i < n_leaf else "spine switch"
+        _add_node(nid, nid, role, score, is_rc)
 
-    # Edges: sample hosts → leaf (round-robin)
-    host_list = sorted(shown_hosts)
-    for idx, hid in enumerate(host_list):
-        leaf = f"SWITCH-{(idx % n_leaf) + 1}"
-        edges.append({"id": f"e_{hid}_{leaf}", "source": hid, "target": leaf, "mainStat": "access"})
+    # ── 2. Host-component nodes: RC + top-5 candidates + context hosts ─────────
+    # Collect host indices from top5 (e.g. "hdd-35" → host 35)
+    interesting_hosts: set[int] = set()
+    for cid in top5_scores:
+        parts = cid.rsplit("-", 1)
+        if len(parts) == 2 and parts[0] in ("cpu", "gpu", "ram", "hdd", "job"):
+            try:
+                interesting_hosts.add(int(parts[1]))
+            except ValueError:
+                pass
+
+    # Always include RC host
+    if rc_type in ("cpu", "gpu", "ram", "hdd", "job"):
+        interesting_hosts.add(int(rc_id_num))
+
+    # A few context hosts (indices 0–3) so the graph is never empty
+    for h in range(min(4, 100)):
+        interesting_hosts.add(h)
+
+    # Cap at 12 host nodes for readability
+    for host_idx in sorted(interesting_hosts)[:12]:
+        # Pick the most informative component type for this host index:
+        # prefer whichever type is in top5, fall back to rc_type, then "cpu"
+        best_score = 0.0
+        best_nid   = f"cpu-{host_idx}"
+        is_rc_host = False
+
+        for ctype in ("hdd", "ram", "cpu", "gpu", "job"):
+            candidate = f"{ctype}-{host_idx}"
+            s = top5_scores.get(candidate, 0.0)
+            if s > best_score:
+                best_score = s
+                best_nid   = candidate
+            if rc_type == ctype and rc_id_num == host_idx:
+                is_rc_host = True
+                best_nid   = rc_node_id
+                best_score = confidence
+
+        subtitle = "RC" if is_rc_host else ("top-5" if best_score > 0.001 else "host")
+        _add_node(best_nid, best_nid, subtitle, best_score, is_rc_host)
+
+        # Edge: host-component → its leaf switch (real round-robin from topology)
+        leaf_sw_idx = host_leaf(host_idx)
+        leaf_nid    = f"switch-{leaf_sw_idx}"
+        edges.append({
+            "id":       f"e_{best_nid}_sw{leaf_sw_idx}",
+            "source":   best_nid,
+            "target":   leaf_nid,
+            "mainStat": "access",
+        })
+
+    # ── 3. Leaf → Spine uplinks (from build_edge_indices logic) ───────────────
+    for leaf_i in range(n_leaf):
+        for spine_i in range(n_leaf, n_sw):
+            edges.append({
+                "id":       f"e_sw{leaf_i}_sw{spine_i}",
+                "source":   f"switch-{leaf_i}",
+                "target":   f"switch-{spine_i}",
+                "mainStat": "uplink",
+            })
 
     return {"nodes": nodes, "edges": edges}
 
