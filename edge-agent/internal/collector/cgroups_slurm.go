@@ -37,7 +37,7 @@ type CgroupsSLURMCollector struct {
 func NewCgroupsSLURMCollector(nodeID string) *CgroupsSLURMCollector {
 	return &CgroupsSLURMCollector{
 		nodeID: nodeID,
-		prev:   make(map[string]cgroupJobStat),
+		prev:   make(map[string]cgroupJobStat),я
 	}
 }
 
