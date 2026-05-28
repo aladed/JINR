@@ -130,6 +130,60 @@ services:
       - jinr_network
     restart: unless-stopped
 
+  # =========================================================================
+  # Grafana API  (FastAPI — serves artifacts for Infinity datasource)
+  # =========================================================================
+  jinr_api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jinr_api
+    command: uvicorn api.grafana_api:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./dataset:/app/dataset:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jinr_network
+    restart: unless-stopped
+
+  # =========================================================================
+  # Grafana 11.3.0  (Node Graph + Infinity datasource)
+  # =========================================================================
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: jinr_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=jinr2024
+      - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/jinr_rca.json
+    volumes:
+      - grafana_storage:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      jinr_api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - jinr_network
+    restart: unless-stopped
+
 networks:
   jinr_network:
     driver: bridge
@@ -140,4 +194,6 @@ volumes:
   redis_storage:
     driver: local
   ollama_models:
+    driver: local
+  grafana_storage:
     driver: local
