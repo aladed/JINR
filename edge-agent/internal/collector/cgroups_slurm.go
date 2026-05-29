@@ -18,12 +18,12 @@ import (
 
 // cgroupJobStat holds per-job counters between ticks for rate computation.
 type cgroupJobStat struct {
-	cpuUsageNs  uint64
-	ioReadBytes uint64
+	cpuUsageNs   uint64
+	ioReadBytes  uint64
 	ioWriteBytes uint64
-	netRxBytes  uint64
-	netTxBytes  uint64
-	ts          time.Time
+	netRxBytes   uint64
+	netTxBytes   uint64
+	ts           time.Time
 }
 
 // CgroupsSLURMCollector reads cgroup v2 accounting for SLURM jobs.
@@ -37,7 +37,7 @@ type CgroupsSLURMCollector struct {
 func NewCgroupsSLURMCollector(nodeID string) *CgroupsSLURMCollector {
 	return &CgroupsSLURMCollector{
 		nodeID: nodeID,
-		prev:   make(map[string]cgroupJobStat),я
+		prev:   make(map[string]cgroupJobStat),
 	}
 }
 

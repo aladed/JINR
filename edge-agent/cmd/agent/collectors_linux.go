@@ -26,4 +26,7 @@ func registerCollectors(reg *collector.Registry, cfg *config.Config) {
 	if cfg.Collectors.NvmlGPU.Enabled {
 		reg.Register(collector.NewGPUCollector(cfg.NodeID))
 	}
+	if cfg.Collectors.PMem.Enabled {
+		reg.Register(collector.NewPMemCollector(cfg.NodeID))
+	}
 }

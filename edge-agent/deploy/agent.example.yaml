@@ -18,4 +18,4 @@ collectors:
     snmp:
       targets: []
       community: "public"
-  pmem:         { enabled: false }
+  pmem:         { enabled: true }    # H04 Optane nodes; no-op where PMEM is absent

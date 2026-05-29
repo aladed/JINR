@@ -92,6 +92,8 @@ func defaults() *Config {
 			LinuxMem:     CollectorToggle{Enabled: true},
 			LinuxDisk:    CollectorToggle{Enabled: true},
 			CgroupsSLURM: CollectorToggle{Enabled: true},
+			// PMEM is safe cluster-wide: nodes without Optane emit nothing.
+			PMem: CollectorToggle{Enabled: true},
 		},
 	}
 }
