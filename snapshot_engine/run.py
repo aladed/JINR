@@ -125,9 +125,17 @@ def main() -> None:
         return
 
     # ── Live Kafka loop ────────────────────────────────────────────────────
-    from snapshot_engine.consumer   import TelemetryConsumer
-    from snapshot_engine.features   import EntityMapper, assemble_x_dict
-    from snapshot_engine.normalizer import apply_normalization
+    import threading
+
+    from snapshot_engine.consumer       import TelemetryConsumer
+    from snapshot_engine.features       import EntityMapper, assemble_x_dict
+    from snapshot_engine.normalizer     import apply_normalization
+    from snapshot_engine.reconciliation import (
+        ReconciliationLoop,
+        TelemetryJobPlacementSource,
+        TopologyState,
+        extract_job_placement,
+    )
 
     consumer = TelemetryConsumer(
         brokers=[b.strip() for b in args.brokers.split(",")],
@@ -137,6 +145,23 @@ def main() -> None:
     )
     mapper = EntityMapper()
 
+    # Reconciliation: the live topology starts from the static skeleton, then a
+    # background worker rebuilds dynamic job edges from observed placement every
+    # RECONCILE_INTERVAL_SEC — self-healing the graph against lost job events.
+    topo_state       = TopologyState(edge_index_dict, edge_attr_dict)
+    placement_source = TelemetryJobPlacementSource()
+    reconciler       = ReconciliationLoop(topo_state, placement_source, mapper=mapper)
+
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=reconciler.run_forever,
+        args=(stop_event,),
+        name="reconciliation-worker",
+        daemon=True,
+    )
+    worker.start()
+
+    tick = 0
     logger.info("Snapshot-engine running. Ctrl+C to stop.")
     try:
         while True:
@@ -145,10 +170,17 @@ def main() -> None:
                 logger.debug("No samples this tick — waiting.")
                 continue
 
+            tick += 1
             try:
-                x_dict     = assemble_x_dict(samples, mapper)
-                x_dict     = apply_normalization(x_dict, scaler_stats)
-                prediction = engine.predict(x_dict, edge_index_dict, edge_attr_dict)
+                # Feed observed job→host placement to the reconciliation source.
+                placement_source.observe(extract_job_placement(samples, mapper), tick)
+
+                x_dict = assemble_x_dict(samples, mapper)
+                x_dict = apply_normalization(x_dict, scaler_stats)
+
+                # Read the latest reconciled topology (worker may have swapped it).
+                ei_now, ea_now = topo_state.current()
+                prediction = engine.predict(x_dict, ei_now, ea_now)
                 publish(prediction, path=output_path)
             except Exception as exc:
                 logger.error("Tick processing failed: %s", exc, exc_info=True)
@@ -156,6 +188,8 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Snapshot-engine stopped.")
     finally:
+        stop_event.set()
+        worker.join(timeout=5.0)
         consumer.close()
 
 

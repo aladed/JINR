@@ -53,7 +53,11 @@
       "Bash(python3 -m py_compile api/replay_buffer.py api/grafana_api.py snapshot_engine/features.py)",
       "Bash(rm -f /tmp/test_replay_logic.py)",
       "Bash(python3 -c \"import torch; print\\('torch', torch.__version__\\)\")",
-      "Bash(python3 -m py_compile snapshot_engine/attention.py snapshot_engine/inference.py api/grafana_api.py)"
+      "Bash(python3 -m py_compile snapshot_engine/attention.py snapshot_engine/inference.py api/grafana_api.py)",
+      "Bash(python3 -m py_compile snapshot_engine/reconciliation.py snapshot_engine/features.py snapshot_engine/run.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m py_compile snapshot_engine/reconciliation.py snapshot_engine/features.py snapshot_engine/run.py snapshot_engine/inference.py snapshot_engine/attention.py api/grafana_api.py api/replay_buffer.py)",
+      "Bash(python3 -m py_compile snapshot_engine/rwr.py snapshot_engine/inference.py)"
     ],
     "additionalDirectories": [
       "/private/tmp"

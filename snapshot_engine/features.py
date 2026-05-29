@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import polars as pl
 import torch
@@ -80,6 +80,12 @@ class EntityMapper:
         self._host_reg:   Dict[str, int] = {}
         self._switch_reg: Dict[str, int] = {}
         self._job_reg:    Dict[str, int] = {}
+        # Job indices support eviction (reconciliation): a monotonic high-water
+        # counter plus a free-list lets finished jobs release their slot without
+        # the index collisions that len(registry) would cause after deletions.
+        self._job_next: int = 0
+        self._job_free: List[int] = []
+        self._job_idx_to_key: Dict[int, str] = {}
 
     def _assign(self, registry: Dict[str, int], key: str, cap: int) -> Optional[int]:
         if key in registry:
@@ -88,6 +94,19 @@ class EntityMapper:
         if idx >= cap:
             return None  # overflow, skip
         registry[key] = idx
+        return idx
+
+    def _assign_job(self, key: str, cap: int) -> Optional[int]:
+        """Assign a job index with free-list reuse (eviction-safe)."""
+        if key in self._job_reg:
+            return self._job_reg[key]
+        idx = self._job_free.pop() if self._job_free else self._job_next
+        if idx >= cap:
+            return None  # overflow, skip
+        if idx == self._job_next:
+            self._job_next += 1
+        self._job_reg[key] = idx
+        self._job_idx_to_key[idx] = key
         return idx
 
     def resolve(
@@ -115,15 +134,41 @@ class EntityMapper:
             if not job_key:
                 m = re.search(r":job(.+)$", entity_id)
                 job_key = m.group(1) if m else entity_id
-            return self._assign(self._job_reg, job_key, NODE_COUNTS["job"])
+            return self._assign_job(job_key, NODE_COUNTS["job"])
 
         return None
+
+    def resolve_job_host(self, entity_id: str) -> Optional[int]:
+        """Resolve a job's host index from its entity_id "{hostname}:job{id}".
+
+        Maps the hostname through the shared host registry so the host index
+        matches the cpu/gpu/ram/hdd nodes on the same machine. Used by the
+        reconciliation loop to rebuild (job → executes_on → cpu) edges.
+        """
+        hostname = entity_id.split(":")[0]
+        return self._assign(self._host_reg, hostname, NODE_COUNTS["cpu"])
+
+    def evict_jobs(self, job_indices: Iterable[int]) -> None:
+        """Release finished job indices back to the free-list (self-healing).
+
+        Called by the reconciliation loop with job indices no longer present in
+        the authoritative placement. Their slots become reusable by future jobs.
+        """
+        for idx in job_indices:
+            key = self._job_idx_to_key.pop(idx, None)
+            if key is None:
+                continue
+            self._job_reg.pop(key, None)
+            self._job_free.append(idx)
 
     def reset(self) -> None:
         """Clear all registries (call between independent inference sessions)."""
         self._host_reg.clear()
         self._switch_reg.clear()
         self._job_reg.clear()
+        self._job_next = 0
+        self._job_free.clear()
+        self._job_idx_to_key.clear()
 
 
 # ---------------------------------------------------------------------------

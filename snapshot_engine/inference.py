@@ -8,11 +8,13 @@ Run:
     result = engine.predict(x_dict, edge_index_dict, edge_attr_dict)
 
 Result dict:
-    rc_node_type  : str
-    rc_node_id    : int
-    confidence    : float   (sigmoid of top logit)
+    rc_node       : {"type": str, "id": int}   root cause chosen by RWR (2.3.4)
+    confidence    : float   (anomaly probability of the RWR-selected node)
+    rc_method     : str     ("rwr" | "argmax_fallback")
+    rc_node_local : {"type", "id"}             per-node argmax (audit/fallback)
+    rwr_ranking   : [{"id": "type-idx", "score": float}]  RWR stationary ranking
     fault_type    : str     (placeholder — training used 3 fault types)
-    top5_candidates : List[{"type": str, "id": int, "score": float}]
+    top5_candidates : List[{"id": "type-idx", "score": float}]
     victim_nodes  : []      (populated downstream by publisher/RAG)
     graph_id      : int     (tick counter)
     edge_xai      : {"method": str, "edges": [{"source","target","relation","weight"}]}
@@ -29,6 +31,7 @@ import torch
 
 from training_pipeline.train import GATv2Hetero
 from snapshot_engine.attention import build_edge_xai
+from snapshot_engine.rwr import rank_root_causes, restart_scores_from_edges
 
 logger = logging.getLogger(__name__)
 
@@ -117,16 +120,9 @@ class InferenceEngine:
         # Sort descending by score
         all_candidates.sort(key=lambda c: c["score"], reverse=True)
 
-        rc = all_candidates[0]
+        # Local (per-node argmax) candidate — kept for audit / fallback.
+        local_rc = all_candidates[0]
         top5 = all_candidates[:5]
-
-        # Heuristic fault_type from rc_node_type
-        fault_map = {
-            "hdd":    "hdd_degradation",
-            "switch": "network_congestion",
-            "ram":    "ram_leak",
-        }
-        fault_type = fault_map.get(rc["type"], "unknown")
 
         # Explainable-AI edge weighting for the Grafana Node Graph (L6).
         # Uses the static inference topology (edge_index_dict) so the weighted
@@ -140,11 +136,44 @@ class InferenceEngine:
             edge_attr_dict=ea_dev,
         )
 
+        # Root-Cause Analysis via Random Walk with Restart (L4, diploma 2.3.4).
+        # RWR aggregates the local per-node scores (restart vector) and per-edge
+        # weights (transition matrix) into a global ranking, concentrating mass
+        # on the cascade root. Falls back to the local argmax when the XAI graph
+        # is empty (no anomalous edges this tick).
+        rwr_restart = restart_scores_from_edges(edge_xai["edges"], scores_by_type)
+        rwr_ranking = rank_root_causes(edge_xai["edges"], rwr_restart)
+
+        if rwr_ranking:
+            rc_id_str = rwr_ranking[0]["id"]          # "{type}-{idx}"
+            rc_type, _, rc_idx_s = rc_id_str.rpartition("-")
+            rc = {"type": rc_type, "id": int(rc_idx_s)}
+            rc_method = "rwr"
+        else:
+            rc = {"type": local_rc["type"], "id": local_rc["id"]}
+            rc_method = "argmax_fallback"
+
+        # confidence stays the node's anomaly probability (interpretable),
+        # not the RWR mass (which is a relative ranking score).
+        rc_confidence = scores_by_type.get(rc["type"], [0.0])[rc["id"]] \
+            if rc["id"] < len(scores_by_type.get(rc["type"], [])) else local_rc["score"]
+
+        # Heuristic fault_type from the RWR-selected root-cause node type.
+        fault_map = {
+            "hdd":    "hdd_degradation",
+            "switch": "network_congestion",
+            "ram":    "ram_leak",
+        }
+        fault_type = fault_map.get(rc["type"], "unknown")
+
         return {
             "graph_id":        self._tick,
             "fault_type":      fault_type,
             "rc_node":         {"type": rc["type"], "id": rc["id"]},
-            "confidence":      round(rc["score"], 4),
+            "confidence":      round(float(rc_confidence), 4),
+            "rc_method":       rc_method,
+            "rc_node_local":   {"type": local_rc["type"], "id": local_rc["id"]},
+            "rwr_ranking":     rwr_ranking,
             "top5_candidates": [{"id": f"{c['type']}-{c['id']}", "score": round(c['score'], 4)} for c in top5],
             "victim_nodes":    [],  # filled by downstream RAG/LLM layer
             "edge_xai":        edge_xai,
