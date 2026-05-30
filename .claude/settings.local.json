@@ -67,7 +67,8 @@
       "Bash(echo \"linux exit=$?\")",
       "Bash(echo \"vet exit=$?\")",
       "Bash(echo \"darwin=$?\")",
-      "Bash(echo \"linux=$?\")"
+      "Bash(echo \"linux=$?\")",
+      "Bash(python3 -m py_compile snapshot_engine/features.py)"
     ],
     "additionalDirectories": [
       "/private/tmp"

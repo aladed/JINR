@@ -1,23 +1,33 @@
 """
-features.py — Proto Batch → temporal state → x_dict
+features.py — Proto Batch → temporal state → x_dict, via Polars PIT join.
 
-Pipeline:
-  1. EntityMapper            : entity_id → (node_type, node_index)
-  2. batch_to_temporal_state : List[pb.Sample] → Dict[str, Tensor[N, F, 4]]
-     Uses Polars Point-in-Time Join: for each (entity_type, entity_id, metric_name)
-     keeps the sample with the highest timestamp_unix_ns, eliminating stale
-     readings when multiple Kafka batches arrive within one inference tick.
-  3. build_final_node_features (from dataset_generator) : → Dict[str, Tensor[N, D]]
+Pipeline (all Polars-native up to the stateful mapper step):
+  1. _samples_to_df          : List[pb.Sample] → typed Polars DataFrame
+  2. _point_in_time_join     : sort by timestamp DESC + group_by(et, eid, mn).first()
+                               → one row per key, holding the temporally LATEST
+                               reading (PIT-deduplicates the stream so stale
+                               values from earlier Kafka batches never enter the
+                               graph snapshot).
+  3. .join(_TOPOLOGY_SCHEMA_DF) : inner-join the deduped frame with the static
+                               topology schema frame on (entity_type, metric_name)
+                               → vectorised resolution of feat_idx; unknown
+                               metrics are dropped in a single pass. This is the
+                               actual JOIN between telemetry and the topology
+                               skeleton, executed by Polars, not by a Python loop.
+  4. EntityMapper            : entity_id → node_index — stateful (free-list,
+                               eviction), so this single resolution step stays
+                               in Python; everything before it is columnar.
 
-Critical layout (verified against build_final_node_features):
+Output layout (verified against build_final_node_features):
   temporal_state[nt] shape: [num_nodes, num_features, 4]
   channels: [value, delta_short, delta_long, rolling_var]
   These come DIRECTLY from proto — Go agent already computed them.
 
-Why Polars for the join:
-  - Vectorised columnar ops replace a Python for-loop over potentially 100k+ samples/tick.
-  - sort().group_by().first() is a single-pass operation on Arrow memory; no GIL pressure.
-  - Explicit timestamp-based deduplication makes "last value wins" semantics auditable.
+Why Polars:
+  - Sort + group_by + inner-join run on Arrow memory in a single columnar pass,
+    no GIL pressure — replaces what was a per-row Python schema lookup.
+  - The PIT semantics ("last-value-wins per key as of now") and the topology
+    join are both auditable Polars operations, not opaque Python control flow.
 """
 
 from __future__ import annotations
@@ -38,15 +48,8 @@ logger = logging.getLogger(__name__)
 # entity_type values the model accepts (link_edge is excluded by design)
 _ACCEPTED_TYPES: frozenset[str] = frozenset({"cpu", "gpu", "ram", "hdd", "switch", "job"})
 
-# Pre-built feature-index lookup: entity_type → {metric_name → column_index}
-# Avoids O(F) list.index() inside the hot iteration over DataFrame rows.
-_FEAT_IDX: Dict[str, Dict[str, int]] = {
-    nt: {feat: i for i, feat in enumerate(feats)}
-    for nt, feats in FEATURE_SCHEMA.items()
-    if nt != "rca_context"
-}
-
-# Explicit Polars schema — avoids dtype inference on every tick.
+# Explicit Polars schema for the raw-samples frame — avoids dtype inference
+# on every tick.
 _SAMPLES_SCHEMA: Dict[str, pl.PolarsDataType] = {
     "entity_type":       pl.Utf8,
     "entity_id":         pl.Utf8,
@@ -58,6 +61,30 @@ _SAMPLES_SCHEMA: Dict[str, pl.PolarsDataType] = {
     "rolling_var":       pl.Float32,
     "labels_job_id":     pl.Utf8,
 }
+
+# Static topology lookup frame: (entity_type, metric_name) → feat_idx.
+# Built once at import; used as the right-hand side of the Polars topology join,
+# replacing what used to be a Python dict lookup inside the hot row loop.
+# This is the *second half* of the diploma's point-in-time join:
+#   1. PIT-dedup the telemetry stream (one row per (et, eid, mn) at the latest ts)
+#   2. JOIN with the static topology schema to resolve feat_idx — Polars-native.
+_TOPOLOGY_SCHEMA_DF: pl.DataFrame = pl.DataFrame(
+    {
+        "entity_type": [
+            et for et, feats in FEATURE_SCHEMA.items() if et != "rca_context"
+            for _ in feats
+        ],
+        "metric_name": [
+            mn for et, feats in FEATURE_SCHEMA.items() if et != "rca_context"
+            for mn in feats
+        ],
+        "feat_idx": [
+            i for et, feats in FEATURE_SCHEMA.items() if et != "rca_context"
+            for i, _ in enumerate(feats)
+        ],
+    },
+    schema={"entity_type": pl.Utf8, "metric_name": pl.Utf8, "feat_idx": pl.Int32},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -264,47 +291,56 @@ def batch_to_temporal_state(
     samples: list,   # List of proto pb.Sample objects
     mapper: EntityMapper,
 ) -> Dict[str, torch.Tensor]:
-    """Convert a list of proto Samples to temporal_state dict.
+    """Convert a list of proto Samples to temporal_state dict via Polars PIT join.
 
     Returns Dict[node_type, Tensor[N, F, 4]] ready for build_final_node_features().
     Missing metrics stay 0. entity_type="link" is silently dropped.
 
-    The Point-in-Time Join (via Polars) guarantees that each (entity, metric)
-    slot in the output tensor holds the temporally latest reading, not an
-    arbitrary one from mid-iteration.
+    Three Polars stages — this is the full "point-in-time join" the diploma
+    describes:
+      1. _samples_to_df          : proto Samples → typed columnar frame
+      2. _point_in_time_join     : sort by ts desc + group_by (et, eid, mn).first()
+                                    → one row per key, holding the temporally
+                                    latest reading (PIT-dedup of the stream)
+      3. .join(_TOPOLOGY_SCHEMA_DF) : inner join with the static schema frame to
+                                    resolve feat_idx — drops unknown metrics in
+                                    a single vectorised pass. This is the actual
+                                    JOIN between telemetry and the topology
+                                    skeleton, executed by Polars, not Python.
+
+    Only after the Polars pipeline collapses the data to the minimum
+    (deduplicated, schema-matched) set of rows do we hand off to the mapper
+    (stateful, must stay in Python) for the entity_id → node_idx resolution.
     """
     state = _make_empty_temporal()
 
     if not samples:
         return state
 
-    # ── Step 1: materialise all samples into a columnar DataFrame ──────────
+    # ── Stage 1: materialise samples into a columnar DataFrame ─────────────
     raw_df = _samples_to_df(samples)
 
-    # ── Step 2: Point-in-Time Join — one row per (entity, metric) ──────────
-    joined = _point_in_time_join(raw_df)
+    # ── Stages 2 + 3: PIT dedup, then JOIN with static topology schema ─────
+    joined = (
+        _point_in_time_join(raw_df)
+        .join(_TOPOLOGY_SCHEMA_DF, on=["entity_type", "metric_name"], how="inner")
+    )
 
     n_input  = len(raw_df)
     n_joined = len(joined)
     if n_input != n_joined:
         logger.debug(
-            "Point-in-Time Join: %d samples → %d unique (entity, metric) pairs "
-            "(dropped %d stale readings)",
+            "Polars PIT join: %d samples → %d (et, eid, mn) rows mapped to topology "
+            "(dropped %d stale/unknown)",
             n_input, n_joined, n_input - n_joined,
         )
 
-    # ── Step 3: fill tensor from deduplicated rows ──────────────────────────
+    # ── Stage 4: resolve entity_id → node_idx (stateful) and write tensors ─
+    # feat_idx already came from the Polars join — no Python schema lookup left.
     skipped = 0
-
     for row in joined.iter_rows(named=True):
-        et = row["entity_type"]
-        feat_map = _FEAT_IDX.get(et)
-        if feat_map is None:
-            continue
-
-        feat_idx = feat_map.get(row["metric_name"])
-        if feat_idx is None:
-            continue
+        et       = row["entity_type"]
+        feat_idx = row["feat_idx"]
 
         labels = {"job_id": row["labels_job_id"]} if row["labels_job_id"] else {}
         node_idx = mapper.resolve(et, row["entity_id"], labels)
