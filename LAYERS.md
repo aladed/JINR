@@ -1,222 +1,189 @@
-# System Layers: GNN RCA Pipeline
+# Послойная модель pipeline
 
-## Layer Model
+Документ описывает **актуальный** end-to-end pipeline репозитория после cleanup 2026-05-31.
+Legacy telemetry stack (`edge-agent`, `snapshot_engine`) — в
+[`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md).
 
-```
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃                LAYER 0: INPUT (GNN)                    ┃
-┃  ────────────────────────────────────────────────────  ┃
-┃  File: artifacts/inference_sample.json                 ┃
-┃  Size: ~1 KB per graph                                 ┃
-┃  Rate: 150 graphs/test                                 ┃
-┃                                                        ┃
-┃  Schema: {                                             ┃
-┃    graph_id, fault_type, rc_node,                     ┃
-┃    confidence, top5_candidates, victim_nodes          ┃
-┃  }                                                     ┃
-┃                                                        ┃
-┃  Entry Point: remediation/run.py                      ┃
-┃  Load: remediation/pipeline.py::load_inference()      ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-                          │
-                          ▼
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃           LAYER 1: KNOWLEDGE RETRIEVAL (RAG)            ┃
-┃  ────────────────────────────────────────────────────  ┃
-┃  Purpose: Find relevant SOP (Standard Operating Proc)  ┃
-┃  Latency: < 2 ms (vector DB cache hit)                ┃
-┃                                                        ┃
-┃  Components:                                           ┃
-┃  • rag/retriever.py                                    ┃
-┃    └─ semantic_search(query, top_k=5)                 ┃
-┃    └─ uses: Qdrant vector database                    ┃
-┃                                                        ┃
-┃  • rag/redis_context.py                                ┃
-┃    └─ get_context(incident_id)                        ┃
-┃    └─ cache: fault type, topology info                ┃
-┃                                                        ┃
-┃  • rag/knowledge_base.py                               ┃
-┃    └─ load_sops()                                      ┃
-┃    └─ 7 SOP types: CHECK_METRICS, APPLY_QOS, ...      ┃
-┃                                                        ┃
-┃  Output: {                                             ┃
-┃    sop_chunks_retrieved: 5,                           ┃
-┃    retrieval_method: "qdrant_semantic",               ┃
-┃    sop_content: [...]                                 ┃
-┃  }                                                     ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-                          │
-                          ▼
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃         LAYER 2: REASONING & GENERATION (LLM)           ┃
-┃  ────────────────────────────────────────────────────  ┃
-┃  Purpose: Generate remediation actions from context    ┃
-┃  Latency: 6.4 sec (Mistral 7B inference)              ┃
-┃  Backend: Ollama (local) or remote API                ┃
-┃                                                        ┃
-┃  Components:                                           ┃
-┃  • llm/llm_client.py                                   ┃
-┃    └─ LLMClient(backend="ollama", model="mistral")    ┃
-┃    └─ generate(prompt) → JSON response                ┃
-┃                                                        ┃
-┃  • llm/prompt_builder.py                               ┃
-┃    └─ build_messages(inference, sops, context)        ┃
-┃    └─ includes: incident summary, SOP guidance        ┃
-┃                                                        ┃
-┃  • llm/response_parser.py                              ┃
-┃    └─ normalize_playbook_dict(raw_response)           ┃
-┃    └─ extract: action_id, target, parameters          ┃
-┃                                                        ┃
-┃  Prompt Structure:                                     ┃
-┃  ┌─────────────────────────────────────┐              ┃
-┃  │ System: You are RCA remediation AI  │              ┃
-┃  │ Context: {fault_type, rc_node, ...} │              ┃
-┃  │ SOPs: {5 relevant procedures}       │              ┃
-┃  │ Task: Generate remediation playbook │              ┃
-┃  └─────────────────────────────────────┘              ┃
-┃                                                        ┃
-┃  Output: {                                             ┃
-┃    actions: [                                          ┃
-┃      {action_id, target_node, parameters}             ┃
-┃    ]                                                   ┃
-┃  }                                                     ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-                          │
-                          ▼
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃      LAYER 3: VALIDATION & SECURITY (FIREWALL)          ┃
-┃  ────────────────────────────────────────────────────  ┃
-┃  Purpose: Block dangerous/invalid actions              ┃
-┃  Latency: < 1 ms (semantic validation)                ┃
-┃  Design: LLM has NO direct terminal access             ┃
-┃                                                        ┃
-┃  Components:                                           ┃
-┃  • remediation/firewall.py                             ┃
-┃    └─ validate_playbook(actions)                      ┃
-┃    └─ allowed: CHECK_METRICS, APPLY_QOS, ...          ┃
-┃    └─ blocked: rm -rf, kill *, dd if=/dev/zero        ┃
-┃                                                        ┃
-┃  • remediation/models.py                               ┃
-┃    └─ Action(BaseModel)  [Pydantic]                   ┃
-┃    └─ RemediationPlaybook(BaseModel)                  ┃
-┃    └─ validates: type, target, parameters             ┃
-┃                                                        ┃
-┃  Validation Rules:                                     ┃
-┃  ✓ action_id in ALLOWED_ACTIONS                       ┃
-┃  ✓ target_node matches topology                       ┃
-┃  ✓ parameters type match schema                       ┃
-┃  ✗ keyword blacklist: rm, dd, kill, fork, ...        ┃
-┃                                                        ┃
-┃  Output: {                                             ┃
-┃    firewall_status: "PASSED" | "BLOCKED",             ┃
-┃    firewall_error: null | "error message"             ┃
-┃  }                                                     ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-                          │
-                          ▼
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃         LAYER 4: AGGREGATION & OUTPUT (REPORT)          ┃
-┃  ────────────────────────────────────────────────────  ┃
-┃  Purpose: Combine all pipeline data into report        ┃
-┃  Latency: < 10 ms (aggregation + formatting)          ┃
-┃                                                        ┃
-┃  Components:                                           ┃
-┃  • remediation/incident_aggregator.py                  ┃
-┃    └─ aggregate(inference) → incident metadata        ┃
-┃    └─ determines: severity, summary, category         ┃
-┃                                                        ┃
-┃  • remediation/pipeline.py                             ┃
-┃    └─ run_pipeline(inference) → (playbook, metadata)  ┃
-┃    └─ orchestrates: layers 1-3                        ┃
-┃    └─ remediation_report_payload() → JSON             ┃
-┃                                                        ┃
-┃  • remediation/run.py                                  ┃
-┃    └─ format_report(playbook, metadata)               ┃
-┃    └─ human-readable terminal output                  ┃
-┃    └─ saves: artifacts/remediation_report.json        ┃
-┃                                                        ┃
-┃  Final Output: {                                       ┃
-┃    incident: {id, severity, summary, fault_type},    ┃
-┃    rc_node: {type, id, host_id},                     ┃
-┃    context: {hostname, os, labels},                  ┃
-┃    knowledge: {sop_chunks, retrieval_method},        ┃
-┃    playbook: {actions: [...]},                       ┃
-┃    firewall_status: "PASSED",                         ┃
-┃    ttr_breakdown: {                                   ┃
-┃      gnn_ms, rag_ms, llm_ms, firewall_ms              ┃
-┃    }                                                   ┃
-┃  }                                                     ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-                          │
-                          ▼
-                   artifacts/remediation_report.json
-                   (JSON output for integration)
-                   
-                   Terminal output
-                   (Human-readable summary)
+---
+
+## Обзор слоёв
+
+```text
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  LAYER -1: GNN RCA (graph → ranked root cause)                ┃
+┃  ───────────────────────────────────────────────────────────  ┃
+┃  Entry:  demo_data/gnn_samples/*.pt  или  production graph    ┃
+┃  Code:   gnn/inference.py, gnn/model.py                       ┃
+┃  Output: top-k RC candidates, logits, anomalous metrics        ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              v
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  LAYER 0: INCIDENT ADAPTER (GNN → inference contract)         ┃
+┃  ───────────────────────────────────────────────────────────  ┃
+┃  Code:   integrations/gnn_to_incident.py                      ┃
+┃  Output: { graph_id, rc_node, confidence, top5_candidates,    ┃
+┃            victim_nodes, fault_type, key_metrics, ... }       ┃
+┃  Alt input: artifacts/inference_sample.json (без GNN)         ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              v
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  LAYER 1: KNOWLEDGE RETRIEVAL (RAG)                           ┃
+┃  ───────────────────────────────────────────────────────────  ┃
+┃  Code:   rag/retriever.py, rag/qdrant_store.py,               ┃
+┃          rag/redis_context.py, rag/knowledge_base.py,         ┃
+┃          rag/history_tickets.py                                 ┃
+┃  Services (optional): Qdrant :6333, Redis :6379                 ┃
+┃  Fallback: empty context / mock SOP (--mock-rag)              ┃
+┃  Output: sop_chunks, retrieval_method, incident history       ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              v
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  LAYER 2: REASONING & GENERATION (LLM)                        ┃
+┃  ───────────────────────────────────────────────────────────  ┃
+┃  Code:   llm/llm_client.py, llm/prompt_builder.py,            ┃
+┃          llm/response_parser.py                               ┃
+┃  Backend: Ollama (mistral) or rule-based fallback             ┃
+┃  Output: structured playbook { actions: [...] }               ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              v
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  LAYER 3: VALIDATION & SECURITY (FIREWALL)                    ┃
+┃  ───────────────────────────────────────────────────────────  ┃
+┃  Code:   remediation/firewall.py, remediation/models.py       ┃
+┃  Rules:  whitelist Action DSL, keyword blacklist              ┃
+┃  Output: firewall_status PASSED | BLOCKED                     ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              v
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  LAYER 4: AGGREGATION & OUTPUT (REPORT)                       ┃
+┃  ───────────────────────────────────────────────────────────  ┃
+┃  Code:   remediation/incident_aggregator.py,                  ┃
+┃          remediation/pipeline.py, remediation/run.py          ┃
+┃  Output: artifacts/remediation_report.json                    ┃
+┃          artifacts/gnn_llm_demo_trace.json (E2E demo)         ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
-## Responsibilities by Layer
+---
 
-| Layer | Responsibility | Failure Mode | Recovery |
-|-------|-----------------|--------------|----------|
-| 0 | GNN inference | No RC found | Use null RC |
-| 1 | Knowledge retrieval | No SOPs found | Use empty context |
-| 2 | LLM generation | Invalid JSON | Parse with fallback |
-| 3 | Validation | Action blocked | Use rule-based fallback |
-| 4 | Aggregation | Never fails | Always produces report |
+## Ответственность слоёв
 
-## Entry Points
+| Слой | Ответственность | Сбой | Деградация |
+|---|---|---|---|
+| -1 GNN | Ранжирование 406 RC-кандидатов | Нет checkpoint → ошибка | — |
+| 0 Adapter | Нормализация GNN output в contract | Пустой top-k | null RC |
+| 1 RAG | SOP + context + history | Qdrant/Redis недоступны | mock / empty context |
+| 2 LLM | Генерация playbook | Ollama недоступен | rule-based fallback |
+| 3 Firewall | Блокировка опасных actions | action blocked | fallback playbook |
+| 4 Report | Агрегация metadata + TTR | — | всегда пишет JSON |
 
-### CLI
+---
+
+## Точки входа
+
+### Полный pipeline: GNN → RAG → LLM (рекомендуется)
+
 ```bash
-cd JINR-rag
+# Полностью offline (mock LLM + mock RAG)
+python -m app.demo_gnn_llm_pipeline --sample demo_data/gnn_samples/data_3.pt --mock
+
+# Real mode (нужны Ollama, Qdrant, Redis — или auto-fallback)
+python -m app.demo_gnn_llm_pipeline --sample demo_data/gnn_samples/data_3.pt
+```
+
+### Только GNN inference
+
+```bash
+python -m gnn.inference --sample demo_data/gnn_samples/data_3.pt --top-k 5
+```
+
+### Только RAG/LLM (из готового inference JSON)
+
+```bash
 python -m remediation.run
+# читает artifacts/inference_sample.json
+# пишет  artifacts/remediation_report.json
 ```
 
-### Programmatic
+### Программный вызов
+
 ```python
+from gnn.inference import GNNInferenceEngine
+from integrations.gnn_to_incident import gnn_to_inference
 from remediation.pipeline import run_pipeline
-playbook, metadata = run_pipeline(inference_dict)
+
+engine = GNNInferenceEngine()
+gnn_out = engine.predict("demo_data/gnn_samples/data_3.pt", top_k=5)
+inference = gnn_to_inference(gnn_out)
+playbook, metadata = run_pipeline(inference)
 ```
 
-### Testing
+---
+
+## Тесты
+
+Актуальный test suite — **23 теста** в двух файлах:
+
 ```bash
-pytest tests/test_full_system_integration.py -v
+python -m pytest tests/ -v
 ```
 
-## Performance Budget
+| Файл | Покрытие |
+|---|---|
+| `tests/test_gnn_integration.py` | adapter, prompt guardrails, firewall, E2E mock, real GNN inference |
+| `tests/test_rag_pipeline.py` | firewall, pipeline mock, Qdrant/fake-redis, TTR budget |
 
-```
-Total TTR = 6.4 seconds
+Legacy-тесты v3 pipeline (`test_full_system_integration.py`, `test_diagnostics.py`,
+`test_listwise.py`) перенесены в архив на диск.
 
-[GNN]      14 ms  (3.5% overhead)
-[RAG]      <2 ms  (<0.1% overhead)
-[LLM]      6.4s   (96% dominant)
-[Firewall] <1 ms  (<0.1% overhead)
-[Output]   <10ms  (<0.2% overhead)
-```
+---
 
-LLM generation dominates. Optimization: parallel RAG retrieval or cached responses.
+## Бюджет задержек (ориентир)
 
-## Dependencies
+Typical run на локальной машине (mock mode):
 
-### Python Packages
-- **torch**: GNN inference
-- **torch_geometric**: Heterogeneous graph operations
-- **pydantic**: Schema validation
-- **qdrant-client**: Vector database
-- **redis**: Context caching
-- **requests/httpx**: LLM API calls
-- **pytest**: Testing
+| Этап | Latency | Доля |
+|---|---:|---:|
+| GNN inference | ~10–50 ms | <1% |
+| RAG retrieval | <5 ms (cache) | <0.1% |
+| LLM (Mistral 7B) | 3–10 s | доминирует |
+| Firewall | <1 ms | <0.1% |
+| Report | <10 ms | <0.1% |
 
-### External Services (Optional)
-- **Ollama**: Local Mistral 7B inference
-- **Qdrant**: Vector database (can run local Docker)
-- **Redis**: Context cache (can run local Docker)
+В real mode LLM доминирует. Оптимизации: `--mock-llm`, quantized model, кэш Redis.
 
-### Offline Mode
-All layers gracefully degrade:
-- RAG: Uses empty context if Qdrant unavailable
-- LLM: Uses rule-based fallback if Ollama unavailable
-- Firewall: Always validates locally
+---
+
+## Зависимости
+
+### Python (см. `requirements.txt`, `requirements_rag.txt`)
+
+- **torch**, **torch_geometric** — GNN
+- **pydantic** — Action DSL / playbook schema
+- **qdrant-client**, **redis** — RAG (optional)
+- **httpx/requests** — Ollama API
+- **pytest** — тests
+
+### Внешние сервисы (optional)
+
+| Сервис | Назначение | Offline fallback |
+|---|---|---|
+| Ollama :11434 | LLM inference | rule-based playbook |
+| Qdrant :6333 | vector SOP search | mock / empty |
+| Redis :6379 | incident context cache | in-memory skip |
+
+Core safety layer (firewall) работает **всегда локально**, без внешних сервисов.
+
+---
+
+## Связанные документы
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — домен + software architecture
+- [`DEPLOYMENT.md`](DEPLOYMENT.md) — Docker Compose и init scripts
+- [`README.md`](README.md) — метрики, benchmarks, команды
+- [`remediation/README.md`](remediation/README.md) — детали Action DSL

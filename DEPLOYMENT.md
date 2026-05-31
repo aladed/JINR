@@ -1,547 +1,373 @@
-# Deployment Guide: GNN RCA System
+# Руководство по развёртыванию
 
-## Overview
-
-Complete Docker-based deployment with all dependencies (Qdrant, Redis, Ollama, Python app).
-
-**Features**:
-- ✓ Full containerization
-- ✓ Automated health checks
-- ✓ Volume persistence
-- ✓ Network isolation
-- ✓ One-command initialization
-- ✓ Cross-platform (Linux, macOS, Windows)
+Актуально для репозитория после cleanup 2026-05-31. Core stack:
+**GNN inference + RAG/LLM remediation**. Legacy telemetry consumer
+(`edge-agent`, `snapshot_engine`) — в [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md).
 
 ---
 
-## Prerequisites
+## Режимы запуска
 
-### System Requirements
-- **Docker Desktop** 4.0+
-- **Docker Compose** 2.0+
-- **Disk space**: 15 GB minimum (Ollama models ~4GB, Qdrant vectors ~2GB, misc ~2GB)
-- **RAM**: 8 GB minimum (16 GB recommended for Mistral 7B)
-- **CPU**: 4+ cores recommended
+| Режим | Когда использовать | Docker | Сервисы |
+|---|---|---|---|
+| **Offline demo** | Разработка, CI, дипломная demo | не нужен | нет |
+| **Local + services** | Real LLM/RAG на хосте | опционально | Ollama/Qdrant/Redis локально |
+| **Docker Compose (core)** | Воспроизводимое окружение RAG/LLM | да | redis, qdrant, ollama, jinr |
+| **Docker Compose (full)** | + Grafana dashboards | да | + jinr_api, grafana, kafka* |
 
-### Installation
-
-#### Linux (Ubuntu/Debian)
-```bash
-# Install Docker
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-
-# Install Docker Compose (built into Docker Desktop, or)
-sudo apt-get install docker-compose-plugin
-
-# Add your user to docker group (optional)
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-#### macOS
-```bash
-# Install Docker Desktop
-brew install --cask docker
-
-# Start Docker Desktop from Applications menu
-```
-
-#### Windows
-```powershell
-# Install Docker Desktop
-choco install docker-desktop
-
-# Or download from: https://www.docker.com/products/docker-desktop
-```
+\* `kafka` в compose оставлен для совместимости; без archived `snapshot_engine`
+не используется в текущем pipeline.
 
 ---
 
-## Quick Start (3 Steps)
+## Быстрый старт без Docker (рекомендуется для первого знакомства)
 
-### 1. Clone and Navigate
 ```bash
 cd JINR-rag
+
+# Установка зависимостей
+pip install -r requirements.txt
+pip install -r requirements_rag.txt
+
+# Положить GNN checkpoint (не в git)
+# gnn/checkpoints/best_v5a_40_screening.pt
+
+# Тесты (23 passed)
+python -m pytest tests/ -q
+
+# E2E demo полностью offline
+python -m app.demo_gnn_llm_pipeline --sample demo_data/gnn_samples/data_3.pt --mock
+
+# Только GNN
+python -m gnn.inference --sample demo_data/gnn_samples/data_3.pt --top-k 5
 ```
 
-### 2. Run Initialization Script
+Переменные окружения для GNN:
 
-**Linux/macOS**:
+```bash
+# Windows PowerShell
+$env:GNN_CHECKPOINT = "gnn/checkpoints/best_v5a_40_screening.pt"
+```
+
+---
+
+## Требования для Docker
+
+| Ресурс | Минимум | Рекомендуется |
+|---|---|---|
+| Docker Desktop | 4.0+ | latest |
+| Docker Compose | 2.0+ | plugin |
+| Disk | 15 GB | 25 GB (Ollama models ~4 GB) |
+| RAM | 8 GB | 16 GB (Mistral 7B) |
+| CPU | 4 cores | 8 cores |
+
+---
+
+## Docker Compose: core stack
+
+### 1. Подготовка
+
+```bash
+cd JINR-rag
+cp .env.example .env   # опционально, для кастомизации
+```
+
+### 2. Инициализация
+
+**Linux/macOS:**
+
 ```bash
 chmod +x init-system.sh
 ./init-system.sh
 ```
 
-**Windows PowerShell**:
+**Windows PowerShell:**
+
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 .\init-system.ps1
 ```
 
-**Manual (Any OS)**:
+**Вручную:**
+
 ```bash
-docker-compose up -d
-# Wait 30 seconds for services to start
-docker-compose exec jinr ollama pull mistral
-docker-compose exec jinr pytest tests/ -v
+docker-compose up -d qdrant redis ollama
+# дождаться healthcheck (~30 с)
+docker-compose exec ollama ollama pull mistral
+docker-compose build jinr
+docker-compose up -d jinr
 ```
 
-### 3. Run the System
+### 3. Запуск pipeline
+
 ```bash
+# RAG/LLM из inference_sample.json (default CMD контейнера jinr)
 docker-compose exec jinr python -m remediation.run
-# Output: artifacts/remediation_report.json
+
+# Или E2E с GNN (нужен checkpoint в volume)
+docker-compose exec jinr python -m app.demo_gnn_llm_pipeline \
+  --sample demo_data/gnn_samples/data_3.pt --mock
 ```
 
 ---
 
-## Architecture
+## Сервисы в `docker-compose.yml`
 
+### Core (RAG/LLM remediation)
+
+| Service | Container | Port | Image |
+|---|---|---|---|
+| redis | jinr_redis | 6379 | redis:7-alpine |
+| qdrant | jinr_qdrant | 6333, 6334 | qdrant/qdrant:latest |
+| ollama | jinr_ollama | 11434 | ollama/ollama:latest |
+| jinr | jinr_app | 8000 | custom (Dockerfile) |
+
+Volumes `jinr`: `./artifacts`, `./checkpoints`, `./dataset`.
+
+### Observability (optional)
+
+| Service | Container | Port | Назначение |
+|---|---|---|---|
+| jinr_api | jinr_api | 8080 | FastAPI для Grafana Infinity |
+| grafana | jinr_grafana | 3000 | Node Graph dashboard (admin/jinr2024) |
+
+```bash
+docker-compose up -d jinr_api grafana
+# Grafana: http://localhost:3000
+# API health: curl http://localhost:8080/health
 ```
-┌─────────────────────────────────────────────────────┐
-│ Docker Network: jinr_network                        │
-└─────────────────────────────────────────────────────┘
-           │
-    ┌──────┼──────┬──────────────┐
-    │      │      │              │
-    ▼      ▼      ▼              ▼
-  Redis  Qdrant Ollama    Python App
-  :6379  :6333  :11434     (flask/cli)
-    │      │      │              │
-    └──────┴──────┴──────────────┘
-           │
-    ┌──────▼──────┐
-    │  Shared     │
-    │  Volumes:   │
-    │  - artifacts│
-    │  - dataset  │
-    │  - checkpts │
-    └─────────────┘
-```
 
-### Services
+### Legacy / unused in current pipeline
 
-| Service | Image | Port | Purpose |
-|---------|-------|------|---------|
-| **redis** | redis:7-alpine | 6379 | Context caching |
-| **qdrant** | qdrant/qdrant | 6333 | Vector database |
-| **ollama** | ollama/ollama | 11434 | LLM inference |
-| **jinr** | custom (Dockerfile) | 8000 | Python app |
+| Service | Container | Port | Статус |
+|---|---|---|---|
+| kafka | jinr_kafka | 9092 | archived consumer; можно не поднимать |
 
 ---
 
-## Configuration
+## Архитектура Docker-сети
 
-### Using Environment Variables
-
-Create `.env` file from template:
-```bash
-cp .env.example .env
+```text
+┌─────────────────────────────────────────────────────────┐
+│  Network: jinr_network                                    │
+└─────────────────────────────────────────────────────────┘
+         │
+    ┌────┼────────┬──────────┬──────────────┐
+    ▼    ▼        ▼          ▼              ▼
+  Redis Qdrant  Ollama    jinr_app     jinr_api ──► Grafana
+  :6379 :6333   :11434    (Python)     :8080       :3000
+    │    │        │          │
+    └────┴────────┴──────────┘
+              │
+    Shared host volumes:
+    ./artifacts  ./checkpoints  ./dataset
 ```
 
-Edit `.env` to customize:
+---
+
+## Конфигурация
+
+### `.env` (из `.env.example`)
+
+Ключевые переменные:
+
 ```bash
-# Example modifications:
+QDRANT_HOST=qdrant
+REDIS_HOST=redis
 OLLAMA_HOST=http://ollama:11434
 LLM_MODEL=mistral
-LLM_TEMPERATURE=0.3
-REDIS_HOST=redis
-QDRANT_HOST=qdrant
+
+# Пути внутри контейнера
+INFERENCE_PATH=/app/artifacts/inference_sample.json
+REPORT_PATH=/app/artifacts/remediation_report.json
 ```
 
-Docker Compose will automatically load from `.env`.
+Для GNN checkpoint вне compose defaults:
 
-### Configuration Files
+```bash
+GNN_CHECKPOINT=/app/gnn/checkpoints/best_v5a_40_screening.pt
+```
 
-- **docker-compose.yml** — Service definitions
-- **.env.example** — Environment template
-- **Dockerfile** — Python application image
+Смонтируйте checkpoint:
+
+```yaml
+# docker-compose.override.yml (локально)
+services:
+  jinr:
+    volumes:
+      - ./gnn/checkpoints:/app/gnn/checkpoints:ro
+```
+
+### Файлы конфигурации
+
+| Файл | Назначение |
+|---|---|
+| `docker-compose.yml` | Определение сервисов |
+| `.env.example` | Шаблон переменных |
+| `Dockerfile` | Python 3.12 app image |
+| `init-system.sh` / `init-system.ps1` | Авто-init |
 
 ---
 
-## Operations
+## Операции
 
-### Start System
+### Старт / стоп
+
 ```bash
-# Start all containers
 docker-compose up -d
+docker-compose logs -f jinr
 
-# Follow logs
-docker-compose logs -f
+docker-compose down          # сохранить volumes
+docker-compose down -v       # удалить volumes
 ```
 
-### Stop System
-```bash
-# Stop containers (preserve volumes)
-docker-compose down
+### Команды в контейнере
 
-# Stop and remove volumes (full cleanup)
-docker-compose down -v
-```
-
-### Run Commands in Container
 ```bash
-# Run single command
 docker-compose exec jinr python -m remediation.run
-
-# Interactive shell
-docker-compose exec jinr /bin/bash
-
-# Run tests
+docker-compose exec jinr python -m app.demo_gnn_llm_pipeline \
+  --sample demo_data/gnn_samples/data_3.pt --mock
 docker-compose exec jinr pytest tests/ -v
-
-# View logs
-docker-compose logs jinr        # Current logs
-docker-compose logs -f jinr     # Follow logs
-docker-compose logs --tail=100  # Last 100 lines
+docker-compose exec jinr /bin/bash
 ```
 
-### Health Checks
+### Health checks
+
 ```bash
-# Check if all services are healthy
 docker-compose ps
 
-# Manually check service status
-curl http://localhost:6333/health      # Qdrant
-curl http://localhost:11434/api/tags   # Ollama
-redis-cli -p 6379 ping                 # Redis (via docker)
-docker exec jinr_redis redis-cli ping
+curl http://localhost:6333/health       # Qdrant
+curl http://localhost:11434/api/tags    # Ollama
+docker exec jinr_redis redis-cli ping   # Redis
+curl http://localhost:8080/health        # Grafana API
 ```
 
-### Rebuild Images
+### Rebuild после изменений кода
+
 ```bash
-# Rebuild Python app image after code changes
 docker-compose build jinr
-
-# Rebuild all images
-docker-compose build
-
-# Rebuild without cache
-docker-compose build --no-cache
+docker-compose up -d jinr
 ```
 
 ---
 
 ## Troubleshooting
 
-### Docker Daemon Not Running
-**Error**: `Cannot connect to Docker daemon`
+### Docker daemon не запущен
 
-**Fix**:
-- Windows/macOS: Open Docker Desktop application
+- Windows/macOS: открыть Docker Desktop
 - Linux: `sudo systemctl start docker`
 
-### Port Already in Use
-**Error**: `Bind for 0.0.0.0:6333 failed: port is already allocated`
+### Порт занят (6333, 11434, 3000, …)
 
-**Fix**:
-```bash
-# Find what's using the port
-lsof -i :6333  # macOS/Linux
-netstat -ano | findstr :6333  # Windows
-
-# Kill the process or change port in docker-compose.yml
+```powershell
+# Windows
+netstat -ano | findstr :6333
 ```
 
-### Ollama Model Download Too Slow
-**Tip**: Let it run overnight, or pull manually:
+Изменить mapping в `docker-compose.yml` или остановить конфликтующий процесс.
+
+### OOM при Mistral 7B
+
+1. Увеличить RAM для Docker Desktop (Settings → Resources)
+2. Quantized model: `ollama pull mistral:4bit`, `LLM_MODEL=mistral:4bit`
+3. Demo без LLM: `--mock-llm`
+
+### Qdrant collection not found
+
 ```bash
-docker exec jinr_ollama ollama pull mistral:latest
-```
-
-### Out of Memory
-**Error**: `OOMKilled` container
-
-**Fix**:
-1. Allocate more RAM to Docker:
-   - Windows/macOS: Docker Desktop → Settings → Resources
-   - Linux: Check system RAM with `free -h`
-2. Or use quantized model:
-   ```bash
-   docker exec jinr_ollama ollama pull mistral:4bit
-   ```
-
-### Redis Data Loss
-**Issue**: Data disappears after restart
-
-**Fix**:
-- Ensure volume persistence:
-  ```bash
-  docker volume ls  # Check volumes exist
-  docker-compose exec redis redis-cli BGSAVE  # Manual save
-  ```
-
-### Qdrant Vector Search Failing
-**Error**: `UNAVAILABLE_COLLECTION` or `NOT_FOUND_COLLECTION`
-
-**Fix**:
-```bash
-# Reinitialize knowledge base
 docker-compose exec jinr python -c \
   "from rag.knowledge_base import load_sops; load_sops()"
 ```
 
----
+### GNN checkpoint missing
 
-## Performance Optimization
-
-### 1. GPU Acceleration (Ollama)
-For faster Mistral inference on NVIDIA GPUs:
-
-```bash
-# Install nvidia-docker
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
-curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | \
-  sudo tee /etc/apt/sources.list.d/nvidia-docker.list
-
-sudo apt-get update && sudo apt-get install -y nvidia-docker2
-sudo systemctl restart docker
-
-# Modify docker-compose.yml:
-# ollama:
-#   runtime: nvidia
-#   environment:
-#     - NVIDIA_VISIBLE_DEVICES=all
+```text
+FileNotFoundError: gnn/checkpoints/best_v5a_40_screening.pt
 ```
 
-### 2. Quantized Models
-Use 4-bit quantized Mistral for faster inference:
-
-```bash
-docker exec jinr_ollama ollama pull mistral:4bit
-# Update .env: LLM_MODEL=mistral:4bit
-```
-
-### 3. Caching
-Enable Redis caching for identical queries:
-
-```bash
-# In .env
-DISABLE_CACHE=false
-REDIS_TTL_SECONDS=3600
-```
-
-### 4. Batch Processing
-Process multiple incidents in parallel:
-
-```python
-from remediation.pipeline import run_pipeline
-from concurrent.futures import ThreadPoolExecutor
-
-inferences = [...]  # List of incident JSONs
-
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = executor.map(run_pipeline, inferences)
-```
+Checkpoint не в git. Скопируйте обученную модель в `gnn/checkpoints/` или задайте
+`GNN_CHECKPOINT`. Для RAG-only demo checkpoint не нужен — используйте
+`python -m remediation.run`.
 
 ---
 
-## Monitoring & Logging
+## CI / testing
 
-### View Logs
 ```bash
-# All services
-docker-compose logs
+# Local
+python -m pytest tests/ -q
 
-# Specific service
-docker-compose logs jinr
-docker-compose logs ollama
-docker-compose logs qdrant
-docker-compose logs redis
-
-# Real-time follow
-docker-compose logs -f
-
-# Last N lines
-docker-compose logs --tail=50
+# Docker
+docker-compose up -d qdrant redis
+docker-compose build jinr
+docker-compose exec -T jinr pytest tests/ -q
+docker-compose down
 ```
 
-### Metrics
-```bash
-# Check resource usage
-docker stats
-
-# Container inspection
-docker inspect jinr_app
-```
-
-### Log Files
-Logs are available at:
-- **Application**: `artifacts/app.log`
-- **Qdrant**: Docker logs
-- **Redis**: Docker logs
-- **Ollama**: Docker logs
+Mock mode не требует Ollama/Qdrant и подходит для CI.
 
 ---
 
-## Deployment Scenarios
+## GPU acceleration (Ollama)
 
-### Development (Local)
-```bash
-docker-compose up -d
-docker-compose exec jinr python -m remediation.run
+На Linux с NVIDIA GPU можно добавить в `docker-compose.yml`:
+
+```yaml
+ollama:
+  runtime: nvidia
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
 ```
 
-### Testing (CI/CD)
-```bash
-docker-compose up -d
-docker-compose exec -T jinr pytest tests/ -v
-docker-compose down -v
-```
-
-### Production (Linux Server)
-```bash
-# Run in background with log rotation
-docker-compose up -d
-docker-compose logs -f > /var/log/jinr.log 2>&1 &
-
-# Monitor with systemd
-# Create: /etc/systemd/system/docker-jinr.service
-[Unit]
-Description=GNN RCA System
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-WorkingDirectory=/app/JINR-rag
-ExecStart=/usr/bin/docker-compose up
-ExecStop=/usr/bin/docker-compose down
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Kubernetes Deployment
-```bash
-# Convert docker-compose to Kubernetes manifests
-kompose convert -f docker-compose.yml
-
-# Deploy
-kubectl apply -f *.yaml
-```
+Требуется nvidia-container-toolkit.
 
 ---
 
-## Backup & Restore
+## Backup volumes
 
-### Backup Volumes
 ```bash
-# Backup Qdrant data
+# Qdrant
 docker run --rm -v jinr-rag_qdrant_storage:/data \
-  -v $(pwd):/backup \
-  alpine tar czf /backup/qdrant-backup.tar.gz -C /data .
+  -v $(pwd):/backup alpine \
+  tar czf /backup/qdrant-backup.tar.gz -C /data .
 
-# Backup Redis data
+# Redis
 docker run --rm -v jinr-rag_redis_storage:/data \
-  -v $(pwd):/backup \
-  alpine tar czf /backup/redis-backup.tar.gz -C /data .
+  -v $(pwd):/backup alpine \
+  tar czf /backup/redis-backup.tar.gz -C /data .
 
-# Backup Ollama models
+# Ollama models
 docker run --rm -v jinr-rag_ollama_models:/data \
-  -v $(pwd):/backup \
-  alpine tar czf /backup/ollama-backup.tar.gz -C /data .
-```
-
-### Restore from Backup
-```bash
-# Remove old volumes
-docker-compose down -v
-
-# Restore
-docker volume create jinr-rag_qdrant_storage
-docker volume create jinr-rag_redis_storage
-docker volume create jinr-rag_ollama_models
-
-docker run --rm -v jinr-rag_qdrant_storage:/data \
-  -v $(pwd):/backup \
-  alpine tar xzf /backup/qdrant-backup.tar.gz -C /data
-
-# Restart
-docker-compose up -d
+  -v $(pwd):/backup alpine \
+  tar czf /backup/ollama-backup.tar.gz -C /data .
 ```
 
 ---
 
 ## Cleanup
 
-### Remove Everything
 ```bash
-# Stop containers and remove volumes
 docker-compose down -v
-
-# Remove images (optional)
-docker rmi jinr-app qdrant/qdrant redis:7-alpine ollama/ollama
-```
-
-### Prune Unused Resources
-```bash
-# Remove dangling images
-docker image prune
-
-# Remove unused volumes
-docker volume prune
-
-# Remove unused networks
-docker network prune
-
-# Full cleanup
-docker system prune -a --volumes
+docker system prune -a --volumes   # осторожно: удалит все unused images
 ```
 
 ---
 
-## Debugging
+## Связанные документы
 
-### Execute Python Commands
-```bash
-docker-compose exec jinr python << 'EOF'
-from remediation.pipeline import run_pipeline
-import json
-
-inference = json.load(open("artifacts/inference_sample.json"))
-playbook, metadata = run_pipeline(inference)
-print(f"Actions: {len(playbook.actions)}")
-print(f"Status: {metadata['firewall_status']}")
-EOF
-```
-
-### Check Service Connectivity
-```bash
-docker-compose exec jinr python << 'EOF'
-import os
-from qdrant_client import QdrantClient
-from redis import Redis
-
-# Test Qdrant
-qdrant = QdrantClient(host=os.getenv("QDRANT_HOST"), port=6333)
-print(f"Qdrant: {qdrant.get_collections()}")
-
-# Test Redis
-redis = Redis(host=os.getenv("REDIS_HOST"), port=6379)
-print(f"Redis: {redis.ping()}")
-EOF
-```
-
----
-
-## Support
-
-For issues:
-
-1. Check troubleshooting section above
-2. Review logs: `docker-compose logs`
-3. Verify all services are healthy: `docker-compose ps`
-4. Check documentation: QUICKSTART.md, LAYERS.md
-5. Run tests: `docker-compose exec jinr pytest tests/ -v`
+| Документ | Содержание |
+|---|---|
+| [`README.md`](README.md) | Обзор, benchmarks, команды |
+| [`LAYERS.md`](LAYERS.md) | Послойная модель pipeline |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Software + domain architecture |
+| [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md) | Архив legacy-компонентов |
 
 ---
 
 ## References
 
-- **Docker Compose**: https://docs.docker.com/compose
-- **Docker CLI**: https://docs.docker.com/engine/reference/commandline
-- **Qdrant**: https://qdrant.tech/documentation
-- **Ollama**: https://github.com/ollama/ollama
-- **Redis**: https://redis.io/documentation
+- [Docker Compose](https://docs.docker.com/compose)
+- [Qdrant docs](https://qdrant.tech/documentation)
+- [Ollama](https://github.com/ollama/ollama)
+- [Redis docs](https://redis.io/documentation)

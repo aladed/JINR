@@ -96,6 +96,10 @@ LLM не заменяет GNN: она не ранжирует 406 кандида
 | Loss в экспериментах | Global cross-entropy по всем RC-кандидатам графа |
 | Checkpoint | `gnn/checkpoints/best_v5a_40_screening.pt` |
 
+Checkpoint-файл не хранится в git как обычный исходный код. Для real inference
+положите его в `gnn/checkpoints/` или укажите путь через переменную окружения
+`GNN_CHECKPOINT`.
+
 Причина выбора GNN: при каскадных сбоях истинная причина не всегда является
 самым аномальным локальным узлом. Она может определяться согласованным паттерном
 деградации соседних компонентов. Message passing позволяет передавать сигнал по
@@ -301,7 +305,7 @@ JINR-rag/
 │   ├── ablation_study.py              # v5a_40 baselines and graph probes
 │   └── structural_benchmark.py        # v6_topology_screen stress-test
 ├── dataset/
-│   └── v6_topology_screen/            # generated topology-dependent stress-test
+│   └── v6_topology_screen/            # metadata for generated topology stress-test
 ├── demo_data/
 │   └── gnn_samples/                   # small demo graphs
 ├── reports/
@@ -314,6 +318,23 @@ JINR-rag/
     ├── test_gnn_integration.py
     └── test_rag_pipeline.py
 ```
+
+## Документация
+
+| Файл | Назначение |
+|---|---|
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Software architecture, графовая модель, домен HPC |
+| [`LAYERS.md`](LAYERS.md) | Послойная модель pipeline (GNN → RAG → LLM → firewall) |
+| [`DEPLOYMENT.md`](DEPLOYMENT.md) | Локальный запуск, Docker Compose, troubleshooting |
+| [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md) | Куда вынесены legacy-компоненты |
+
+## Legacy archive
+
+Устаревшие root-доки, phase-артефакты, `edge-agent/`, `snapshot_engine/`,
+`e2e_simulator/` и связанные v3-скрипты вынесены на диск:
+
+- `D:\Vlad\JINR-rag-archive\legacy-2026-05-31\`
+- краткая ссылка в репозитории: `docs/LEGACY_ARCHIVE.md`
 
 ## Основные отчёты
 
@@ -377,6 +398,10 @@ python scripts/ablation_study.py
 # topology-dependent benchmark
 python scripts/structural_benchmark.py --max-train-graphs 700 --max-val-graphs 300 --epochs 12 --mlp-epochs 3
 ```
+
+`dataset/v6_topology_screen/raw/*.pt` не хранится в git: это воспроизводимый
+generated artifact. Скрипт выше пересоздаёт raw-графы и обновляет
+`reports/structural_benchmark.md`.
 
 ## Citation
 

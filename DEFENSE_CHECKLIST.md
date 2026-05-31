@@ -28,7 +28,7 @@ Command: `python -m remediation.run`
 Expected: Root cause -> Mistral actions -> Firewall PASSED -> Report
 
 ## Files to Show Commission
-1. `artifacts/visualizations/cluster_animation.mp4` (15 sec demo)
+1. `D:\Vlad\JINR-rag-archive\legacy-2026-05-31\artifacts\visualizations\cluster_animation.mp4` (15 sec demo, archived)
 2. `artifacts/visualizations/real_inference_combined.png` (graph + scores)
 3. `artifacts/remediation_report.json` (live output)
 4. Terminal: `python -m remediation.run` (live demo)
