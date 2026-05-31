@@ -21,6 +21,16 @@ estimated_ttr_seconds: realistic seconds for each step
 Use the exact confidence value from the incident payload. Do not use logits as confidence.
 Every action priority MUST be one of 1, 2, or 3. Never output 4 or 5.
 
+Grounding rules:
+- The root-cause node and fault_type were localised by a GNN model (source="gnn").
+  Do NOT change the root-cause node or fault_type unless an SOP excerpt or the
+  technical context explicitly contradicts it. If you are not convinced, your
+  FIRST action must be CHECK_METRICS to gather evidence, plus NOTIFY_OPERATOR.
+- Produce an engineering playbook using ONLY the allowed structured actions above.
+  Never emit free-form shell/bash commands, scripts, or destructive operations.
+- Prefer actions that target the identified root-cause node and protect the
+  affected nodes / running jobs.
+
 Output JSON schema:
 {{
   "incident_id": "graph_<id>_<fault_type>",
@@ -74,11 +84,15 @@ def build_user_prompt(
     payload = {
         "graph_id": inference.get("graph_id"),
         "fault_type": inference.get("fault_type"),
+        "fault_type_provenance": inference.get("fault_type_provenance"),
         "rc_node": rc_node,
         "rc_logit": inference.get("rc_logit"),
         "confidence": inference.get("confidence"),
         "victim_node_count": victim_count,
+        "affected_counts": inference.get("affected_counts", {}),
+        "key_anomalous_metrics": inference.get("key_metrics", {}),
         "top5_candidates": inference.get("top5_candidates", [])[:5],
+        "gnn_provenance": inference.get("gnn_rca", {}),
         "aggregated_incident": incident or {},
         "technical_context": node_context or {},
         "sop_excerpts": sop_contexts,
