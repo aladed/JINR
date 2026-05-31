@@ -1,8 +1,7 @@
 # Руководство по развёртыванию
 
-Актуально для репозитория после cleanup 2026-05-31. Core stack:
-**GNN inference + RAG/LLM remediation**. Legacy telemetry consumer
-(`edge-agent`, `snapshot_engine`) — в [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md).
+Актуально для репозитория. Полный стек:
+**edge-agent → Kafka → snapshot_engine → GNN → RAG/LLM**.
 
 ---
 
@@ -13,10 +12,7 @@
 | **Offline demo** | Разработка, CI, дипломная demo | не нужен | нет |
 | **Local + services** | Real LLM/RAG на хосте | опционально | Ollama/Qdrant/Redis локально |
 | **Docker Compose (core)** | Воспроизводимое окружение RAG/LLM | да | redis, qdrant, ollama, jinr |
-| **Docker Compose (full)** | + Grafana dashboards | да | + jinr_api, grafana, kafka* |
-
-\* `kafka` в compose оставлен для совместимости; без archived `snapshot_engine`
-не используется в текущем pipeline.
+| **Docker Compose (full)** | + telemetry + Grafana | да | + kafka, jinr_api, grafana |
 
 ---
 
@@ -137,11 +133,13 @@ docker-compose up -d jinr_api grafana
 # API health: curl http://localhost:8080/health
 ```
 
-### Legacy / unused in current pipeline
+### Telemetry (L1–L3)
 
-| Service | Container | Port | Статус |
+| Service | Container | Port | Назначение |
 |---|---|---|---|
-| kafka | jinr_kafka | 9092 | archived consumer; можно не поднимать |
+| kafka | jinr_kafka | 9092 | Bus для `edge-agent` → `snapshot_engine` |
+
+Запуск consumer: `python -m snapshot_engine.run`. Edge-agent: `edge-agent/deploy/`.
 
 ---
 

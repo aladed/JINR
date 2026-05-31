@@ -301,6 +301,10 @@ JINR-rag/
 ├── rag/                               # retrieval layer
 ├── llm/                               # LLM client and prompt builder
 ├── remediation/                       # firewall, Action DSL, remediation pipeline
+├── edge-agent/                        # Go telemetry agent (L1–L2)
+├── snapshot_engine/                   # Kafka → snapshot → GNN (L3–L4 hook)
+├── e2e_simulator/                     # end-to-end smoke tests
+├── proto/                             # telemetry protobuf bindings
 ├── scripts/
 │   ├── ablation_study.py              # v5a_40 baselines and graph probes
 │   └── structural_benchmark.py        # v6_topology_screen stress-test
@@ -328,13 +332,23 @@ JINR-rag/
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Локальный запуск, Docker Compose, troubleshooting |
 | [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md) | Куда вынесены legacy-компоненты |
 
+## Telemetry pipeline (L1–L3)
+
+Live-контур сбора и сборки graph snapshot **в репозитории**:
+
+| Путь | Роль |
+|---|---|
+| `edge-agent/` | Go Edge-agent: сбор телеметрии, L2 feature processing, Kafka/Protobuf |
+| `snapshot_engine/` | Kafka consumer, Polars join, HeteroData snapshot, GNN inference hook |
+| `e2e_simulator/` | mock producer + smoke tests |
+| `proto/` | Protobuf bindings для Python |
+
+Kafka-сервис в `docker-compose.yml` используется этим контуром.
+
 ## Legacy archive
 
-Устаревшие root-доки, phase-артефакты, `edge-agent/`, `snapshot_engine/`,
-`e2e_simulator/` и связанные v3-скрипты вынесены на диск:
-
-- `D:\Vlad\JINR-rag-archive\legacy-2026-05-31\`
-- краткая ссылка в репозитории: `docs/LEGACY_ARCHIVE.md`
+Устаревшие root-доки, phase-артефакты и v3 comparison-скрипты вынесены на диск:
+`D:\Vlad\JINR-rag-archive\legacy-2026-05-31\` — см. [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md).
 
 ## Основные отчёты
 

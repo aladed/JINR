@@ -1,7 +1,7 @@
 # Послойная модель pipeline
 
-Документ описывает **актуальный** end-to-end pipeline репозитория после cleanup 2026-05-31.
-Legacy telemetry stack (`edge-agent`, `snapshot_engine`) — в
+Документ описывает **актуальный** end-to-end pipeline: L1–L3 telemetry,
+L4 GNN, L5–L6 RAG/LLM. Старые phase-артефакты — в
 [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md).
 
 ---
@@ -10,7 +10,13 @@ Legacy telemetry stack (`edge-agent`, `snapshot_engine`) — в
 
 ```text
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃  LAYER -1: GNN RCA (graph → ranked root cause)                ┃
+┃  LAYER 1–2: TELEMETRY (edge-agent, Go)                        ┃
+┃  LAYER 3: SNAPSHOT (snapshot_engine, Kafka + Polars)          ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              v
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  LAYER 4 / GNN: RCA (graph → ranked root cause)               ┃
 ┃  ───────────────────────────────────────────────────────────  ┃
 ┃  Entry:  demo_data/gnn_samples/*.pt  или  production graph    ┃
 ┃  Code:   gnn/inference.py, gnn/model.py                       ┃
@@ -127,7 +133,7 @@ playbook, metadata = run_pipeline(inference)
 
 ## Тесты
 
-Актуальный test suite — **23 теста** в двух файлах:
+Актуальный test suite — **36 тестов**:
 
 ```bash
 python -m pytest tests/ -v
@@ -137,9 +143,9 @@ python -m pytest tests/ -v
 |---|---|
 | `tests/test_gnn_integration.py` | adapter, prompt guardrails, firewall, E2E mock, real GNN inference |
 | `tests/test_rag_pipeline.py` | firewall, pipeline mock, Qdrant/fake-redis, TTR budget |
-
-Legacy-тесты v3 pipeline (`test_full_system_integration.py`, `test_diagnostics.py`,
-`test_listwise.py`) перенесены в архив на диск.
+| `tests/test_full_system_integration.py` | full stack integration |
+| `tests/test_diagnostics.py` | batch invariance, diagnostics |
+| `tests/test_listwise.py` | listwise loss / ranking |
 
 ---
 

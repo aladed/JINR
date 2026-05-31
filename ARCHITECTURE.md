@@ -1,9 +1,8 @@
 # Архитектура системы JINR-rag
 
-Документ описывает **текущую** архитектуру репозитория: GNN RCA + RAG/LLM remediation
-для анализа инцидентов в HPC-кластере. Устаревший telemetry pipeline
-(`edge-agent/`, `snapshot_engine/`, `e2e_simulator/`) вынесен в
-[`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md).
+Документ описывает **текущую** архитектуру репозитория: telemetry pipeline L1–L3,
+GNN RCA (L4), RAG/LLM remediation (L5–L6). Phase-артефакты и старые root-доки —
+в [`docs/LEGACY_ARCHIVE.md`](docs/LEGACY_ARCHIVE.md).
 
 Подробные метрики экспериментов — в [`README.md`](README.md) и [`reports/`](reports/).
 Схема признаков и топологии — в [`training_pipeline/config.py`](training_pipeline/config.py).
@@ -27,8 +26,12 @@ LLM **не** заменяет GNN: она не ранжирует кандида
 ## 2. Архитектура ПО (текущий стек)
 
 ```text
-                    demo_data/gnn_samples/*.pt
-                    или production graph snapshot
+  edge-agent (Go) ──Kafka/Protobuf──► snapshot_engine (Polars)
+        |                                      |
+        |                                      v
+        |                              HeteroData snapshot
+        |                                      |
+        +──────── demo_data/*.pt ────────────┘
                               |
                               v
                     +---------------------+
@@ -76,6 +79,10 @@ LLM **не** заменяет GNN: она не ранжирует кандида
 | [`training_pipeline/`](training_pipeline/) | Генерация synthetic dataset, обучение, eval |
 | [`scripts/ablation_study.py`](scripts/ablation_study.py) | Benchmark `v5a_40`, XGBoost baselines, edge probes |
 | [`scripts/structural_benchmark.py`](scripts/structural_benchmark.py) | Topology stress-test `v6_topology_screen` |
+| [`edge-agent/`](edge-agent/) | Go telemetry agent, L1–L2 feature processing |
+| [`snapshot_engine/`](snapshot_engine/) | Kafka consumer, snapshot assembly, inference hook |
+| [`e2e_simulator/`](e2e_simulator/) | Mock producer и smoke tests |
+| [`proto/`](proto/) | Protobuf schema/bindings |
 | [`api/grafana_api.py`](api/grafana_api.py) | REST API для Grafana dashboards (опционально) |
 
 ### Checkpoint и артефакты
@@ -249,7 +256,7 @@ Guardrails: LLM не должна менять root cause без основан�
 |---|---|---|
 | `jinr_api` | 8080 | FastAPI → Grafana Infinity datasource |
 | `grafana` | 3000 | Node Graph dashboard, feedback confirm/reject |
-| `kafka` | 9092 | Legacy telemetry bus; consumer pipeline в архиве |
+| `kafka` | 9092 | Telemetry bus для `edge-agent` → `snapshot_engine` |
 
 ---
 
