@@ -194,7 +194,33 @@ def eval_sklearn(model, val_graphs, feature_fn) -> Dict:
     return _metrics(ranks, fault_idxs)
 
 
-def eval_gnn(val_graphs) -> Dict:
+def _empty_edges_like(graph) -> Tuple[Dict, Dict]:
+    """Build zero-edge dictionaries preserving all edge types and edge dims."""
+    ei_d, ea_d = {}, {}
+    for et in graph.edge_types:
+        ea = graph[et].edge_attr.float()
+        ei_d[et] = torch.empty((2, 0), dtype=graph[et].edge_index.dtype)
+        ea_d[et] = torch.empty((0, ea.shape[1]), dtype=ea.dtype)
+    return ei_d, ea_d
+
+
+def _random_edges_like(graph, seed: int) -> Tuple[Dict, Dict]:
+    """Randomize topology while preserving edge types, counts and edge_attr."""
+    rng = torch.Generator().manual_seed(seed)
+    ei_d, ea_d = {}, {}
+    for et in graph.edge_types:
+        src_t, _, dst_t = et
+        e = graph[et].edge_index.shape[1]
+        src_n = graph[src_t].x.shape[0]
+        dst_n = graph[dst_t].x.shape[0]
+        src = torch.randint(0, src_n, (e,), generator=rng, dtype=graph[et].edge_index.dtype)
+        dst = torch.randint(0, dst_n, (e,), generator=rng, dtype=graph[et].edge_index.dtype)
+        ei_d[et] = torch.stack([src, dst], dim=0)
+        ea_d[et] = graph[et].edge_attr.float()
+    return ei_d, ea_d
+
+
+def eval_gnn(val_graphs, mode: str = "normal") -> Dict:
     from gnn.model import GATv2Hetero
     ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
     m = GATv2Hetero(node_dims=ckpt["node_dims"], edge_types=ckpt["edge_types"],
@@ -203,12 +229,29 @@ def eval_gnn(val_graphs) -> Dict:
     m.eval()
 
     ranks, fault_idxs = [], []
-    for graph in val_graphs:
+    for gi, graph in enumerate(val_graphs):
         x_d  = {nt: graph[nt].x.float() for nt in graph.node_types}
-        ei_d = {et: graph[et].edge_index for et in graph.edge_types}
-        ea_d = {et: graph[et].edge_attr.float() for et in graph.edge_types}
+        if mode == "no_edges":
+            ei_d, ea_d = _empty_edges_like(graph)
+        elif mode == "random_edges":
+            ei_d, ea_d = _random_edges_like(graph, seed=10_000 + gi)
+        else:
+            ei_d = {et: graph[et].edge_index for et in graph.edge_types}
+            ea_d = {et: graph[et].edge_attr.float() for et in graph.edge_types}
         with torch.no_grad():
-            logits = m(x_d, ei_d, ea_d)
+            if mode == "local_only":
+                h = {
+                    nt: torch.nn.functional.elu(m.input_proj[f"proj_{nt}"](x.float()))
+                    for nt, x in x_d.items()
+                    if f"proj_{nt}" in m.input_proj
+                }
+                logits = {}
+                for nt in RC_CANDIDATE_TYPES:
+                    if nt in h:
+                        type_idx = RC_CANDIDATE_TYPES.index(nt)
+                        logits[nt] = m.shared_scorer(h[nt], type_idx).squeeze(-1)
+            else:
+                logits = m(x_d, ei_d, ea_d)
         cands, rc_idx, offset = [], None, 0
         for nt in RC_CANDIDATE_TYPES:
             if nt not in logits:
@@ -322,10 +365,25 @@ def main():
     results["XGBoost (temporal + соседи, ручной граф)"] = m
     print(f"  Hit@1={m['hit1']:.1%}  Hit@3={m['hit3']:.1%}  MRR={m['mrr']:.3f}")
 
-    # 4. GNN
+    # 4. GNN + structural probes
     print("\n[4/4] GATv2Hetero (message passing, end-to-end)...")
-    m = eval_gnn(val_graphs)
+    m = eval_gnn(val_graphs, mode="normal")
     results["GATv2Hetero (наш GNN, end-to-end)"] = m
+    print(f"  Hit@1={m['hit1']:.1%}  Hit@3={m['hit3']:.1%}  MRR={m['mrr']:.3f}")
+
+    print("\n[probe] GNN — NO EDGES (message passing removed at inference)...")
+    m = eval_gnn(val_graphs, mode="no_edges")
+    results["GNN probe (no edges)"] = m
+    print(f"  Hit@1={m['hit1']:.1%}  Hit@3={m['hit3']:.1%}  MRR={m['mrr']:.3f}")
+
+    print("\n[probe] GNN — RANDOM EDGES (topology destroyed, edge counts preserved)...")
+    m = eval_gnn(val_graphs, mode="random_edges")
+    results["GNN probe (random edges)"] = m
+    print(f"  Hit@1={m['hit1']:.1%}  Hit@3={m['hit3']:.1%}  MRR={m['mrr']:.3f}")
+
+    print("\n[probe] GNN — LOCAL ONLY (input projection + SharedScorer, no GAT layers)...")
+    m = eval_gnn(val_graphs, mode="local_only")
+    results["GNN probe (local only scorer)"] = m
     print(f"  Hit@1={m['hit1']:.1%}  Hit@3={m['hit3']:.1%}  MRR={m['mrr']:.3f}")
 
     # итог
@@ -374,6 +432,27 @@ def _write(results, n_faulted, out):
     for name, m in results.items():
         v = m.get("per_fault_hit1", {}).get("network_congestion", 0)
         lines.append(f"| {name} | {v:.1%} |")
+
+    if "GATv2Hetero (наш GNN, end-to-end)" in results:
+        base = results["GATv2Hetero (наш GNN, end-to-end)"]["hit1"]
+        lines += [
+            "",
+            "## Edge-dependence probes",
+            "",
+            "Эти проверки не переобучают модель: они ломают рёбра только на инференсе.",
+            "Если падение маленькое, значит текущий `v5a_40` слишком хорошо решается локальными признаками.",
+            "",
+            "| Probe | Hit@1 | Delta vs normal GNN |",
+            "|-------|------:|--------------------:|",
+        ]
+        for name in [
+            "GNN probe (no edges)",
+            "GNN probe (random edges)",
+            "GNN probe (local only scorer)",
+        ]:
+            if name in results:
+                h = results[name]["hit1"]
+                lines.append(f"| {name} | {h:.1%} | {h - base:+.1%} |")
 
     out.write_text("\n".join(lines), encoding="utf-8")
 
