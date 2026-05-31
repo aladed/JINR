@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.pyo
 artifacts/remediation_report.json
 artifacts/inference_sample.json
 artifacts/gnn_llm_demo_trace.json

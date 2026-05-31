@@ -1,0 +1,28 @@
+Fitting scaler on 10 healthy samples...
+Scaler fitted.
+  [  50/1000]  healthy=31  faulted=19  fault%=38.0  avg_time=0.145s/sample  OOM-safe=True
+  [ 100/1000]  healthy=65  faulted=35  fault%=35.0  avg_time=0.145s/sample  OOM-safe=True
+  [ 150/1000]  healthy=98  faulted=52  fault%=34.7  avg_time=0.145s/sample  OOM-safe=True
+  [ 200/1000]  healthy=137  faulted=63  fault%=31.5  avg_time=0.145s/sample  OOM-safe=True
+  [ 250/1000]  healthy=179  faulted=71  fault%=28.4  avg_time=0.144s/sample  OOM-safe=True
+  [ 300/1000]  healthy=216  faulted=84  fault%=28.0  avg_time=0.144s/sample  OOM-safe=True
+  [ 350/1000]  healthy=253  faulted=97  fault%=27.7  avg_time=0.144s/sample  OOM-safe=True
+  [ 400/1000]  healthy=293  faulted=107  fault%=26.8  avg_time=0.143s/sample  OOM-safe=True
+  [ 450/1000]  healthy=329  faulted=121  fault%=26.9  avg_time=0.143s/sample  OOM-safe=True
+  [ 500/1000]  healthy=366  faulted=134  fault%=26.8  avg_time=0.143s/sample  OOM-safe=True
+  [ 550/1000]  healthy=403  faulted=147  fault%=26.7  avg_time=0.143s/sample  OOM-safe=True
+  [ 600/1000]  healthy=442  faulted=158  fault%=26.3  avg_time=0.144s/sample  OOM-safe=True
+  [ 650/1000]  healthy=474  faulted=176  fault%=27.1  avg_time=0.144s/sample  OOM-safe=True
+  [ 700/1000]  healthy=506  faulted=194  fault%=27.7  avg_time=0.146s/sample  OOM-safe=True
+  [ 750/1000]  healthy=538  faulted=212  fault%=28.3  avg_time=0.151s/sample  OOM-safe=True
+  [ 800/1000]  healthy=574  faulted=226  fault%=28.2  avg_time=0.151s/sample  OOM-safe=True
+  [ 850/1000]  healthy=606  faulted=244  fault%=28.7  avg_time=0.150s/sample  OOM-safe=True
+  [ 900/1000]  healthy=638  faulted=262  fault%=29.1  avg_time=0.150s/sample  OOM-safe=True
+  [ 950/1000]  healthy=667  faulted=283  fault%=29.8  avg_time=0.150s/sample  OOM-safe=True
+  [1000/1000]  healthy=700  faulted=300  fault%=30.0  avg_time=0.150s/sample  OOM-safe=True
+
+Generation complete: 1000 samples in 149.6s (0.150s/sample)
+Manifest written -> dataset\manifest/
+  dataset_hash = 75066199be54df75d58e5d9395e94141e6ee4c8526f01ab911610a5ff5f09ff9
+Metadata saved -> dataset\metadata.json
+Loss config saved -> dataset\loss_config.json
