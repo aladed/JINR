@@ -93,6 +93,14 @@ Start with one of these based on your interest:
 - **[llm/README.md](llm/README.md)** — Layer 2 (Reasoning)
 - **[remediation/README.md](remediation/README.md)** — Layers 3-4 (Validation + Output)
 
+### GNN + LLM/RAG Integration (v5a_40, branch integration/gnn-llm-end-to-end)
+- **[reports/gnn_llm_end_to_end_integration_ru.md](reports/gnn_llm_end_to_end_integration_ru.md)** — Full integration design, demo results, limitations (RU)
+
+**Quick demo** (fully offline, no Docker required):
+```bash
+python -m app.demo_gnn_llm_pipeline --sample demo_data/gnn_samples/data_3.pt --mock
+```
+
 ---
 
 ## 🏗️ Directory Structure

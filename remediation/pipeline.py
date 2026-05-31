@@ -169,6 +169,10 @@ def run_pipeline(
         "knowledge": {
             "sop_chunks_retrieved": len(sop_chunks),
             "retrieval_method": retrieval_method,
+            "sop_chunks": [
+                {"title": chunk.get("title"), "fault_type": chunk.get("fault_type")}
+                for chunk in sop_chunks
+            ],
             "similar_incidents": similar_incidents,
         },
         "ttr_breakdown": ttr_breakdown,
